@@ -155,10 +155,12 @@ def explore_all_endpoints(api_key: str):
     # =========================================================================
     # HOLDINGS ENDPOINTS (Pro+ only)
     # =========================================================================
+    # Holdings endpoints accept instList parameter to filter by instruments
+    inst_list_sample = "3,750"  # ABB and Securitas
     endpoints.extend([
-        ("holdings_insider", "/holdings/insider", {}),
-        ("holdings_shorts", "/holdings/shorts", {}),
-        ("holdings_buyback", "/holdings/buyback", {}),
+        ("holdings_insider", "/holdings/insider", {"instList": inst_list_sample}),
+        ("holdings_shorts", "/holdings/shorts", {"instList": inst_list_sample}),
+        ("holdings_buyback", "/holdings/buyback", {"instList": inst_list_sample}),
     ])
     
     # =========================================================================
