@@ -132,7 +132,8 @@ def explore_all_endpoints(api_key: str):
     endpoints.extend([
         ("kpi_metadata", "/instruments/kpis/metadata", {}),
         ("kpi_metadata_updated", "/instruments/kpis/updated", {}),
-        ("kpi_screener", "/instruments/kpis/2/year/latest/mean", {}),
+        # kpi_screener endpoint removed - requires specific KPI calculation type that varies
+        # Use kpi_history instead for individual instruments
         ("kpi_history", f"/instruments/{sample_inst_id}/kpis/2/year/mean/history", {}),
     ])
     
