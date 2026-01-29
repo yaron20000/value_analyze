@@ -60,7 +60,7 @@ class BorsdataFetcher:
 
     def __init__(self, api_key: str, db_config: dict = None, skip_existing: bool = True):
         self.api_key = api_key
-        self.db_config = db_config
+        self.db_config = db_config                
         self.db_enabled = db_config is not None
         self.skip_existing = skip_existing
         self.conn = None
@@ -165,6 +165,7 @@ class BorsdataFetcher:
             self.conn.rollback()
 
     def save_to_json(self, name: str, data: dict, error: str = None, kpi_name: str = None) -> str:
+        return
         """Save the result to a JSON file in results directory."""
         filepath = os.path.join(RESULTS_DIR, f"{name}.json")
 
@@ -382,7 +383,10 @@ class BorsdataFetcher:
                  {"maxcount": 20}, inst_id),
             ]
 
-            # Tier 1 KPIs - Comprehensive coverage for ML (35 KPIs)
+            # WORKING KPIs ONLY - 52 Total (removed 28 failing KPIs)
+            # See FAILING_KPIS_ANALYSIS.md for details on what was removed and why
+
+            # Tier 1 KPIs - All 35 Work Perfectly (100% success rate)
             # Valuation Metrics (8 KPIs)
             kpi_endpoints = [
                 (1, "dividend_yield", "Dividend Yield"),
@@ -430,7 +434,66 @@ class BorsdataFetcher:
                 (53, "revenue", "Revenue"),
                 (56, "earnings", "Earnings"),
                 (63, "fcf", "Free Cash Flow"),
+
+                # Tier 2 KPIs - Working Subset (10 out of 25)
+                # Per-Share Metrics (6 KPIs) - All work
+                (5, "revenue_per_share", "Revenue per Share"),
+                (6, "eps", "Earnings per Share"),
+                (7, "dividend_per_share", "Dividend per Share"),
+                (8, "book_value_per_share", "Book Value per Share"),
+                (23, "fcf_per_share", "FCF per Share"),
+                (68, "ocf_per_share", "OCF per Share"),
+
+                # Additional Cash Flow (4 KPIs) - All work
+                (24, "fcf_margin_pct", "FCF Margin %"),
+                (27, "earnings_fcf", "Earnings/FCF"),
+                (62, "ocf", "Operating Cash Flow"),
+                (64, "capex", "Capex"),
+
+                # REMOVED: Quality Scores (0/3 working)
+                # - F-Score, Magic Formula, Earnings Stability all fail with Error 400
+                # These are available from holdings endpoints or need to be calculated
+
+                # REMOVED: Technical Indicators (0/5 working)
+                # - Performance, Total Return, RSI, Volatility, Volume all fail
+                # These require daily/real-time data, not annual aggregates
+                # Can be calculated from stockprices_*.json files we already fetch
+
+                # REMOVED: Insider/Ownership (0/7 working)
+                # - All insider and shareholder KPIs fail via /kpis endpoint
+                # This data is available in holdings_insider.json we already fetch
+
+                # Tier 3 KPIs - Working Subset (7 out of 20)
+                # Additional Valuation (2 KPIs) - All work
+                (19, "peg", "PEG Ratio"),
+                (20, "dividend_payout", "Dividend Payout %"),
+
+                # Additional Absolute Metrics (5 KPIs) - All work
+                (54, "ebitda", "EBITDA"),
+                (57, "total_assets", "Total Assets"),
+                (58, "total_equity", "Total Equity"),
+                (60, "net_debt", "Net Debt"),
+                (61, "num_shares", "Number of Shares"),
+
+                # REMOVED: Additional Technical (0/4 working)
+                # - MA200 Rank, MA(50)/MA(200), Volatility Std Dev, Volume Trend
+                # Same issue as technical indicators above
+
+                # REMOVED: Short Selling (0/4 working)
+                # - All short selling KPIs fail via /kpis endpoint
+                # This data is available in holdings_shorts.json we already fetch
+
+                # REMOVED: Buybacks (0/3 working)
+                # - All buyback KPIs fail via /kpis endpoint
+                # This data is available in holdings_buyback.json we already fetch
+
+                # REMOVED: Additional Quality (0/2 working)
+                # - Graham Strategy, Cash Flow Stability
+                # May be premium-only or need to be calculated
             ]
+
+            # Note: We already fetch insider, short selling, and buyback data separately
+            # via the /holdings endpoints. See fetch_global_endpoints() method.
 
             # Add KPI endpoints for this instrument
             for kpi_id, kpi_name, kpi_display_name in kpi_endpoints:
@@ -620,13 +683,13 @@ def main():
     instrument_ids = [int(x.strip()) for x in args.instruments.split(',')]
 
     # Database configuration
-    db_config = None
+    db_config = None    
     if not args.no_db:
         if not args.db_password:
             print("Warning: No database password provided. Running in JSON-only mode.")
             print("Use --db-password to enable database storage, or --no-db to suppress this warning.")
             print()
-        else:
+        else:            
             db_config = {
                 'host': args.db_host,
                 'database': args.db_name,

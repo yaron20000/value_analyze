@@ -123,7 +123,11 @@ Options:
 ### Stock-Specific APIs (per instrument)
 - Stock prices (last 100)
 - Reports (year, R12, quarter, all)
-- KPIs (P/E, P/S, P/B, ROE)
+- **52 KPIs (100% working):**
+  - **Tier 1 (35 KPIs):** Core valuation, profitability, growth, returns, financial health, and size metrics
+  - **Tier 2 (10 KPIs):** Per-share metrics (6), cash flow metrics (4)
+  - **Tier 3 (7 KPIs):** Additional valuation (2), absolute metrics (5)
+  - **Note:** Insider/ownership, short selling, and buyback data are fetched separately via `/holdings` endpoints
 
 ### Array-Based APIs (multiple stocks)
 - Stock prices for all specified instruments
