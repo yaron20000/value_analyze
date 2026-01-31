@@ -6,7 +6,8 @@ This script fetches data from Borsdata API endpoints and stores it in PostgreSQL
 
 Features:
 - Fetches all Instrument Meta APIs
-- Fetches stock-specific APIs for specified stocks
+- Fetches stock-specific APIs for specified stocks or all Nordic instruments
+- Implements rate limiting: 100 API calls per 10 seconds
 - Saves JSON responses to results/ directory before DB insertion
 - Stores raw data in PostgreSQL for future AI processing (optional)
 - Handles API rate limiting and errors gracefully
@@ -15,8 +16,11 @@ Features:
 - Prevents duplicate data insertion using database constraints
 
 Usage:
-    # JSON files only (no database)
-    python fetch_and_store.py YOUR_API_KEY --no-db
+    # Fetch all Nordic instruments (Sweden, Norway, Finland, Denmark)
+    python fetch_and_store.py YOUR_API_KEY --nordics --db-password yourpass
+
+    # Fetch specific instruments only (no database)
+    python fetch_and_store.py YOUR_API_KEY --instruments 3,19,199 --no-db
 
     # With PostgreSQL database (skips existing data by default)
     python fetch_and_store.py YOUR_API_KEY --db-password yourpass
@@ -27,10 +31,10 @@ Usage:
     # With environment variables
     export BORSDATA_API_KEY=your_key
     export DB_PASSWORD=yourpass
-    python fetch_and_store.py
+    python fetch_and_store.py --nordics
 
     # Full database configuration
-    python fetch_and_store.py YOUR_API_KEY --db-host localhost --db-name borsdata --db-user postgres --db-password yourpass
+    python fetch_and_store.py YOUR_API_KEY --db-host localhost --db-name borsdata --db-user postgres --db-password yourpass --nordics
 
 Requirements:
     pip install requests psycopg2-binary python-dotenv
@@ -44,6 +48,7 @@ import os
 import argparse
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
+from collections import deque
 import psycopg2
 from psycopg2.extras import Json
 from dotenv import load_dotenv
@@ -54,18 +59,72 @@ load_dotenv()
 BASE_URL = "https://apiservice.borsdata.se/v1"
 RESULTS_DIR = "results"
 
+# Nordic country IDs (Sverige, Norge, Finland, Danmark)
+NORDIC_COUNTRY_IDS = [1, 2, 3, 4]
+
+
+class RateLimiter:
+    """Rate limiter that allows max_calls within time_window seconds."""
+
+    def __init__(self, max_calls: int = 100, time_window: float = 10.0):
+        """
+        Initialize rate limiter.
+
+        Args:
+            max_calls: Maximum number of calls allowed in time_window
+            time_window: Time window in seconds
+        """
+        self.max_calls = max_calls
+        self.time_window = time_window
+        self.call_times = deque()
+
+    def wait_if_needed(self):
+        """Wait if necessary to respect rate limit."""
+        now = time.time()
+
+        # Remove calls outside the time window
+        while self.call_times and self.call_times[0] <= now - self.time_window:
+            self.call_times.popleft()
+
+        # If we've hit the limit, wait until we can make another call
+        if len(self.call_times) >= self.max_calls:
+            sleep_time = self.call_times[0] + self.time_window - now
+            if sleep_time > 0:
+                print(f"    ⏳ Rate limit reached ({self.max_calls} calls/{self.time_window}s). Waiting {sleep_time:.2f}s...")
+                time.sleep(sleep_time)
+                # Clean up old entries after waiting
+                now = time.time()
+                while self.call_times and self.call_times[0] <= now - self.time_window:
+                    self.call_times.popleft()
+
+        # Record this call
+        self.call_times.append(now)
+
+    def get_stats(self) -> dict:
+        """Get current rate limiter statistics."""
+        now = time.time()
+        # Count calls in current window
+        recent_calls = sum(1 for t in self.call_times if t > now - self.time_window)
+        return {
+            "recent_calls": recent_calls,
+            "max_calls": self.max_calls,
+            "time_window": self.time_window,
+            "remaining": self.max_calls - recent_calls
+        }
+
 
 class BorsdataFetcher:
     """Handles fetching data from Borsdata API and storing to PostgreSQL."""
 
     def __init__(self, api_key: str, db_config: dict = None, skip_existing: bool = True):
         self.api_key = api_key
-        self.db_config = db_config                
+        self.db_config = db_config
         self.db_enabled = db_config is not None
         self.skip_existing = skip_existing
         self.conn = None
         self.cursor = None
         self.fetch_log_id = None
+        self.rate_limiter = RateLimiter(max_calls=100, time_window=10.0)
         self.stats = {
             "total": 0,
             "successful": 0,
@@ -208,34 +267,48 @@ class BorsdataFetcher:
 
     def save_to_db(self, name: str, endpoint_path: str, data: dict,
                    error: str = None, instrument_id: int = None, params: dict = None, kpi_name: str = None):
-        """Save the result to PostgreSQL database using upsert to prevent duplicates."""
+        """Save to DB - only keep new record if data has changed."""
         if not self.db_enabled:
             return
 
         try:
-            # Use ON CONFLICT to update if a similar record exists from today
-            # This prevents duplicate entries for the same endpoint/instrument on the same day
+            # Get the most recent existing data for comparison
             self.cursor.execute("""
-                INSERT INTO api_raw_data
-                (endpoint_name, endpoint_path, instrument_id, kpi_name, fetch_timestamp,
-                 success, error_message, raw_data, request_params)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (
-                name,
-                endpoint_path,
-                instrument_id,
-                kpi_name,
-                datetime.now(),
-                data is not None,
-                error,
-                Json(data) if data else None,
-                Json(params) if params else None
-            ))
+                SELECT raw_data FROM api_raw_data
+                WHERE endpoint_name = %s
+                AND (instrument_id = %s OR (instrument_id IS NULL AND %s IS NULL))
+                ORDER BY fetch_timestamp DESC LIMIT 1
+            """, (name, instrument_id, instrument_id))
 
-            # Check if the insert actually happened
-            if self.cursor.rowcount == 0:
-                print(f"    ℹ Data already exists in DB (skipped)")
+            existing = self.cursor.fetchone()
+
+            if existing and existing[0] == data:
+                # Data unchanged - just update timestamp of existing record
+                self.cursor.execute("""
+                    UPDATE api_raw_data
+                    SET fetch_timestamp = %s
+                    WHERE endpoint_name = %s
+                    AND (instrument_id = %s OR (instrument_id IS NULL AND %s IS NULL))
+                    AND raw_data = %s
+                """, (datetime.now(), name, instrument_id, instrument_id, Json(data)))
+                print(f"    ℹ Data unchanged - updated timestamp only")
+            else:
+                # Data changed (or new) - insert new record
+                self.cursor.execute("""
+                    INSERT INTO api_raw_data
+                    (endpoint_name, endpoint_path, instrument_id, kpi_name, fetch_timestamp,
+                     success, error_message, raw_data, request_params)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    name, endpoint_path, instrument_id, kpi_name,
+                    datetime.now(), data is not None, error,
+                    Json(data) if data else None,
+                    Json(params) if params else None
+                ))
+                if existing:
+                    print(f"    ✓ Data changed - new version saved")
+                else:
+                    print(f"    ✓ New data saved")
 
             self.conn.commit()
         except Exception as e:
@@ -244,6 +317,9 @@ class BorsdataFetcher:
 
     def make_request(self, endpoint: str, params: dict = None) -> Tuple[Optional[dict], Optional[str]]:
         """Make a request to the Borsdata API and return the JSON response and any error."""
+        # Apply rate limiting before making the request
+        self.rate_limiter.wait_if_needed()
+
         url = f"{BASE_URL}{endpoint}"
 
         if params is None:
@@ -333,6 +409,41 @@ class BorsdataFetcher:
             print(f"    ✓ Error logged to {filepath}")
             return False
 
+    def get_nordic_instruments(self) -> List[int]:
+        """Fetch all instruments and filter for Nordic countries."""
+        print("\n" + "="*70)
+        print("GETTING NORDIC INSTRUMENTS")
+        print("="*70)
+
+        # Fetch instruments list
+        data, error = self.make_request("/instruments")
+
+        if error or not data:
+            print(f"✗ Failed to fetch instruments: {error}")
+            return []
+
+        instruments = data.get("instruments", [])
+        print(f"✓ Fetched {len(instruments)} total instruments")
+
+        # Filter for Nordic countries (1=Sverige, 2=Norge, 3=Finland, 4=Danmark)
+        nordic_instruments = [
+            inst["insId"] for inst in instruments
+            if inst.get("countryId") in NORDIC_COUNTRY_IDS
+        ]
+
+        print(f"✓ Found {len(nordic_instruments)} Nordic instruments:")
+        country_counts = {}
+        for inst in instruments:
+            if inst.get("countryId") in NORDIC_COUNTRY_IDS:
+                country_id = inst.get("countryId")
+                country_counts[country_id] = country_counts.get(country_id, 0) + 1
+
+        country_names = {1: "Sweden", 2: "Norway", 3: "Finland", 4: "Denmark"}
+        for country_id, count in sorted(country_counts.items()):
+            print(f"  - {country_names.get(country_id, f'Country {country_id}')}: {count} instruments")
+
+        return nordic_instruments
+
     def fetch_all_metadata(self):
         """Fetch all Instrument Meta APIs (metadata endpoints)."""
         print("\n" + "="*70)
@@ -354,7 +465,6 @@ class BorsdataFetcher:
         for name, endpoint, params in metadata_endpoints:
             print(f"\n[{self.stats['total']+1}] Fetching {name}...")
             self.fetch_endpoint(name, endpoint, params)
-            time.sleep(0.2)  # Rate limiting
 
     def fetch_stock_data(self, instrument_ids: List[int]):
         """Fetch stock-specific data for given instrument IDs."""
@@ -517,7 +627,6 @@ class BorsdataFetcher:
                     name, endpoint, params, iid, kpi_display_name = item
                     print(f"\n  [{self.stats['total']+1}] Fetching {name}...")
                     self.fetch_endpoint(name, endpoint, params, iid, kpi_name=kpi_display_name)
-                time.sleep(0.2)  # Rate limiting
 
         # Fetch array-based endpoints (multiple stocks at once)
         print(f"\n--- Multi-Stock Endpoints ---")
@@ -533,7 +642,6 @@ class BorsdataFetcher:
         for name, endpoint, params in array_endpoints:
             print(f"\n  [{self.stats['total']+1}] Fetching {name}...")
             self.fetch_endpoint(name, endpoint, params)
-            time.sleep(0.2)  # Rate limiting
 
     def fetch_global_endpoints(self, instrument_ids: List[int] = None):
         """Fetch global endpoints (not stock-specific)."""
@@ -572,17 +680,52 @@ class BorsdataFetcher:
         for name, endpoint, params in global_endpoints:
             print(f"\n[{self.stats['total']+1}] Fetching {name}...")
             self.fetch_endpoint(name, endpoint, params)
-            time.sleep(0.2)  # Rate limiting
 
-    def run(self, instrument_ids: List[int]):
+    def run(self, instrument_ids: List[int], fetch_nordics: bool = False):
         """Main execution method."""
         try:
             self.ensure_results_dir()
             self.connect_db()
+
+            # If nordics flag is set, get all nordic instruments
+            if fetch_nordics:
+                # First fetch instruments metadata to get the list
+                print("\n" + "="*70)
+                print("FETCHING INSTRUMENTS METADATA FOR NORDICS")
+                print("="*70)
+                print(f"\n[1] Fetching instruments...")
+                self.fetch_endpoint("instruments", "/instruments", {})
+
+                # Get Nordic instruments
+                instrument_ids = self.get_nordic_instruments()
+
+                if not instrument_ids:
+                    print("✗ No Nordic instruments found. Exiting.")
+                    return
+
             self.create_fetch_log(instrument_ids)
 
-            # Fetch all metadata
-            self.fetch_all_metadata()
+            # Fetch all metadata (skip instruments if already fetched for nordics)
+            if not fetch_nordics:
+                self.fetch_all_metadata()
+            else:
+                # Fetch remaining metadata (instruments already fetched)
+                print("\n" + "="*70)
+                print("FETCHING REMAINING METADATA")
+                print("="*70)
+                metadata_endpoints = [
+                    ("instruments_updated", "/instruments/updated", {}),
+                    ("markets", "/markets", {}),
+                    ("branches", "/branches", {}),
+                    ("sectors", "/sectors", {}),
+                    ("countries", "/countries", {}),
+                    ("translation_metadata", "/translationmetadata", {}),
+                    ("kpi_metadata", "/instruments/kpis/metadata", {}),
+                    ("kpi_metadata_updated", "/instruments/kpis/updated", {}),
+                ]
+                for name, endpoint, params in metadata_endpoints:
+                    print(f"\n[{self.stats['total']+1}] Fetching {name}...")
+                    self.fetch_endpoint(name, endpoint, params)
 
             # Fetch stock-specific data
             self.fetch_stock_data(instrument_ids)
@@ -602,6 +745,7 @@ class BorsdataFetcher:
     def print_summary(self):
         """Print execution summary."""
         duration = time.time() - self.stats['start_time']
+        rate_stats = self.rate_limiter.get_stats()
 
         print("\n" + "="*70)
         print("EXECUTION SUMMARY")
@@ -611,6 +755,12 @@ class BorsdataFetcher:
         print(f"Failed: {self.stats['failed']}")
         print(f"Skipped (already exists): {self.stats['skipped']}")
         print(f"Duration: {duration:.2f} seconds")
+
+        if self.stats['successful'] > 0:
+            avg_rate = self.stats['successful'] / duration if duration > 0 else 0
+            print(f"Average rate: {avg_rate:.2f} calls/second")
+
+        print(f"Rate limit: {rate_stats['max_calls']} calls per {rate_stats['time_window']} seconds")
         print(f"Results saved to: {RESULTS_DIR}/")
 
         if self.db_enabled:
@@ -659,7 +809,11 @@ def main():
 
     parser.add_argument('--instruments',
                        default='3,19,199,750',
-                       help='Comma-separated list of instrument IDs (default: 3,19,199,750 = ABB,Atlas Copco,SEB,Securitas)')
+                       help='Comma-separated list of instrument IDs (default: 3,19,199,750 = ABB,Atlas Copco,SEB,Securitas). Ignored if --nordics is used.')
+
+    parser.add_argument('--nordics',
+                       action='store_true',
+                       help='Fetch all instruments from Nordic countries (Sweden, Norway, Finland, Denmark). Overrides --instruments.')
 
     parser.add_argument('--no-db',
                        action='store_true',
@@ -679,8 +833,10 @@ def main():
         print("       python fetch_and_store.py YOUR_API_KEY --db-password yourpass  # With database")
         sys.exit(1)
 
-    # Parse instrument IDs
-    instrument_ids = [int(x.strip()) for x in args.instruments.split(',')]
+    # Parse instrument IDs (will be overridden if --nordics is used)
+    instrument_ids = []
+    if not args.nordics:
+        instrument_ids = [int(x.strip()) for x in args.instruments.split(',')]
 
     # Database configuration
     db_config = None    
@@ -707,18 +863,24 @@ def main():
         print(f"Skip existing: {'No (force refetch)' if args.force_refetch else 'Yes (within 24 hours)'}")
     else:
         print(f"Database: Disabled (JSON files only)")
-    print(f"Instruments: {instrument_ids}")
+
+    if args.nordics:
+        print(f"Mode: Fetch all Nordic instruments (Sweden, Norway, Finland, Denmark)")
+        print(f"Rate Limit: 100 calls per 10 seconds")
+    else:
+        print(f"Instruments: {instrument_ids}")
+        print(f"Rate Limit: 100 calls per 10 seconds")
+
     print(f"Time: {datetime.now().isoformat()}")
     print("="*70)
 
     # Create and run fetcher
     skip_existing = not args.force_refetch
     fetcher = BorsdataFetcher(args.api_key, db_config, skip_existing=skip_existing)
-    fetcher.run(instrument_ids)
+    fetcher.run(instrument_ids, fetch_nordics=args.nordics)
 
     print("\n✓ Done!")
 
 
 if __name__ == "__main__":
-    # Rate limit 100 calls in 10 seconds
     main()
