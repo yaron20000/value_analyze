@@ -409,6 +409,73 @@ class BorsdataFetcher:
             print(f"    ✓ Error logged to {filepath}")
             return False
 
+    def fetch_kpi_batch(self, kpi_id: int, kpi_name: str, kpi_display_name: str,
+                        instrument_ids: List[int], skip_if_exists: bool = True):
+        """Fetch a single KPI for ALL instruments in one API call.
+
+        This is much more efficient than fetching per-instrument.
+        Reduces API calls from (num_instruments × num_kpis) to just (num_kpis).
+
+        Args:
+            kpi_id: The KPI ID to fetch
+            kpi_name: Short name for identification (e.g., "pe", "roe")
+            kpi_display_name: Display name (e.g., "P/E", "Return on Equity")
+            instrument_ids: List of all instrument IDs to fetch
+            skip_if_exists: If True, skip if data already exists
+        """
+        self.stats['total'] += 1
+
+        # Build the batch endpoint with instList parameter
+        inst_list = ",".join(str(i) for i in instrument_ids)
+        endpoint = f"/instruments/kpis/{kpi_id}/year/mean/history"
+        params = {"instList": inst_list}
+
+        endpoint_name = f"kpi_{kpi_name}_batch"
+
+        # Check if we already have recent data for this batch endpoint
+        if skip_if_exists and self.skip_existing and self.db_enabled:
+            if self.check_existing_data(endpoint_name, None):
+                print(f"    ⏭ Skipping - recent data already exists (within 24 hours)")
+                self.stats['skipped'] += 1
+                return True
+
+        data, error = self.make_request(endpoint, params)
+
+        if data is not None:
+            self.stats['successful'] += 1
+
+            # Save the batch response to DB with instrument_id=None (batch data)
+            if self.db_enabled:
+                self.save_to_db(endpoint_name, endpoint, data, error, None, params, kpi_display_name)
+                print(f"    ✓ Batch KPI {kpi_display_name} saved to database ({len(instrument_ids)} instruments)")
+
+            # Also parse and save individual instrument data for easier querying
+            if self.db_enabled and 'values' in data:
+                # The batch response has format: {"values": [{"i": inst_id, "n": kpi_id, "v": value, "y": year}, ...]}
+                values_by_inst = {}
+                for item in data.get('values', []):
+                    inst_id = item.get('i')
+                    if inst_id not in values_by_inst:
+                        values_by_inst[inst_id] = []
+                    values_by_inst[inst_id].append(item)
+
+                # Save each instrument's data separately for easier querying
+                for inst_id, values in values_by_inst.items():
+                    inst_data = {"values": values}
+                    inst_name = f"kpi_{kpi_name}_{inst_id}"
+                    self.save_to_db(inst_name, endpoint, inst_data, None, inst_id, params, kpi_display_name)
+
+                print(f"    ✓ Parsed into {len(values_by_inst)} individual instrument records")
+
+            return True
+        else:
+            self.stats['failed'] += 1
+            print(f"    ✗ Error: {error}")
+            # Save error to DB for audit trail (consistent with fetch_endpoint)
+            if self.db_enabled:
+                self.save_to_db(endpoint_name, endpoint, data, error, None, params, kpi_display_name)
+            return False
+
     def get_nordic_instruments(self) -> List[int]:
         """Fetch all instruments and filter for Nordic countries."""
         print("\n" + "="*70)
@@ -469,20 +536,22 @@ class BorsdataFetcher:
     def fetch_stock_data(self, instrument_ids: List[int]):
         """Fetch stock-specific data for given instrument IDs."""
         print("\n" + "="*70)
-        print(f"FETCHING STOCK-SPECIFIC DATA FOR INSTRUMENTS: {instrument_ids}")
+        print(f"FETCHING STOCK-SPECIFIC DATA FOR {len(instrument_ids)} INSTRUMENTS")
         print("="*70)
 
         yesterday = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
 
+        # =================================================================
+        # PART 1: Per-instrument endpoints (stockprices, reports)
+        # These don't have efficient batch alternatives for historical data
+        # =================================================================
+        print("\n--- Per-Instrument Endpoints (stockprices, reports) ---")
         for inst_id in instrument_ids:
-            print(f"\n--- Instrument ID: {inst_id} ---")
+            print(f"\n  Instrument ID: {inst_id}")
 
-            # Stock prices
             endpoints = [
                 (f"stockprices_{inst_id}", f"/instruments/{inst_id}/stockprices",
                  {"maxcount": 100}, inst_id),
-
-                # Reports
                 (f"reports_year_{inst_id}", f"/instruments/{inst_id}/reports/year",
                  {"maxcount": 10}, inst_id),
                 (f"reports_r12_{inst_id}", f"/instruments/{inst_id}/reports/r12",
@@ -493,143 +562,111 @@ class BorsdataFetcher:
                  {"maxcount": 20}, inst_id),
             ]
 
-            # WORKING KPIs ONLY - 52 Total (removed 28 failing KPIs)
-            # See FAILING_KPIS_ANALYSIS.md for details on what was removed and why
+            for name, endpoint, params, iid in endpoints:
+                print(f"\n    [{self.stats['total']+1}] Fetching {name}...")
+                self.fetch_endpoint(name, endpoint, params, iid)
 
+        # =================================================================
+        # PART 2: Batch KPI fetching (OPTIMIZED!)
+        # Fetch each KPI for ALL instruments in a single API call
+        # This reduces API calls from (num_instruments × num_kpis) to (num_kpis)
+        # For 700 instruments × 52 KPIs: 36,400 calls → 52 calls
+        # =================================================================
+        print("\n" + "="*70)
+        print(f"FETCHING BATCH KPIs FOR ALL {len(instrument_ids)} INSTRUMENTS")
+        print("="*70)
+        print(f"Using batch endpoint: /instruments/kpis/{{kpi_id}}/year/mean/history?instList=...")
+        print(f"This fetches one KPI for ALL instruments in a single API call!")
+
+        # WORKING KPIs ONLY - 52 Total (removed 28 failing KPIs)
+        # See FAILING_KPIS_ANALYSIS.md for details on what was removed and why
+        kpi_list = [
             # Tier 1 KPIs - All 35 Work Perfectly (100% success rate)
             # Valuation Metrics (8 KPIs)
-            kpi_endpoints = [
-                (1, "dividend_yield", "Dividend Yield"),
-                (2, "pe", "P/E"),
-                (3, "ps", "P/S"),
-                (4, "pb", "P/B"),
-                (10, "ev_ebit", "EV/EBIT"),
-                (11, "ev_ebitda", "EV/EBITDA"),
-                (13, "ev_fcf", "EV/FCF"),
-                (15, "ev_s", "EV/S"),
+            (1, "dividend_yield", "Dividend Yield"),
+            (2, "pe", "P/E"),
+            (3, "ps", "P/S"),
+            (4, "pb", "P/B"),
+            (10, "ev_ebit", "EV/EBIT"),
+            (11, "ev_ebitda", "EV/EBITDA"),
+            (13, "ev_fcf", "EV/FCF"),
+            (15, "ev_s", "EV/S"),
 
-                # Profitability & Margins (6 KPIs)
-                (28, "gross_margin", "Gross Margin"),
-                (29, "operating_margin", "Operating Margin"),
-                (30, "profit_margin", "Profit Margin"),
-                (31, "fcf_margin", "FCF Margin"),
-                (32, "ebitda_margin", "EBITDA Margin"),
-                (51, "ocf_margin", "OCF Margin"),
+            # Profitability & Margins (6 KPIs)
+            (28, "gross_margin", "Gross Margin"),
+            (29, "operating_margin", "Operating Margin"),
+            (30, "profit_margin", "Profit Margin"),
+            (31, "fcf_margin", "FCF Margin"),
+            (32, "ebitda_margin", "EBITDA Margin"),
+            (51, "ocf_margin", "OCF Margin"),
 
-                # Growth Metrics (6 KPIs)
-                (94, "revenue_growth", "Revenue Growth"),
-                (96, "ebit_growth", "EBIT Growth"),
-                (97, "earnings_growth", "Earnings Growth"),
-                (98, "dividend_growth", "Dividend Growth"),
-                (99, "book_value_growth", "Book Value Growth"),
-                (100, "assets_growth", "Assets Growth"),
+            # Growth Metrics (6 KPIs)
+            (94, "revenue_growth", "Revenue Growth"),
+            (96, "ebit_growth", "EBIT Growth"),
+            (97, "earnings_growth", "Earnings Growth"),
+            (98, "dividend_growth", "Dividend Growth"),
+            (99, "book_value_growth", "Book Value Growth"),
+            (100, "assets_growth", "Assets Growth"),
 
-                # Return Metrics (4 KPIs)
-                (33, "roe", "Return on Equity"),
-                (34, "roa", "Return on Assets"),
-                (36, "roc", "Return on Capital"),
-                (37, "roic", "Return on Invested Capital"),
+            # Return Metrics (4 KPIs)
+            (33, "roe", "Return on Equity"),
+            (34, "roa", "Return on Assets"),
+            (36, "roc", "Return on Capital"),
+            (37, "roic", "Return on Invested Capital"),
 
-                # Financial Health (6 KPIs)
-                (39, "equity_ratio", "Equity Ratio"),
-                (40, "debt_to_equity", "Debt to Equity"),
-                (41, "net_debt_pct", "Net Debt %"),
-                (42, "net_debt_ebitda", "Net Debt/EBITDA"),
-                (44, "current_ratio", "Current Ratio"),
-                (46, "cash_pct", "Cash %"),
+            # Financial Health (6 KPIs)
+            (39, "equity_ratio", "Equity Ratio"),
+            (40, "debt_to_equity", "Debt to Equity"),
+            (41, "net_debt_pct", "Net Debt %"),
+            (42, "net_debt_ebitda", "Net Debt/EBITDA"),
+            (44, "current_ratio", "Current Ratio"),
+            (46, "cash_pct", "Cash %"),
 
-                # Size/Absolute Metrics (5 KPIs)
-                (49, "enterprise_value", "Enterprise Value"),
-                (50, "market_cap", "Market Cap"),
-                (53, "revenue", "Revenue"),
-                (56, "earnings", "Earnings"),
-                (63, "fcf", "Free Cash Flow"),
+            # Size/Absolute Metrics (5 KPIs)
+            (49, "enterprise_value", "Enterprise Value"),
+            (50, "market_cap", "Market Cap"),
+            (53, "revenue", "Revenue"),
+            (56, "earnings", "Earnings"),
+            (63, "fcf", "Free Cash Flow"),
 
-                # Tier 2 KPIs - Working Subset (10 out of 25)
-                # Per-Share Metrics (6 KPIs) - All work
-                (5, "revenue_per_share", "Revenue per Share"),
-                (6, "eps", "Earnings per Share"),
-                (7, "dividend_per_share", "Dividend per Share"),
-                (8, "book_value_per_share", "Book Value per Share"),
-                (23, "fcf_per_share", "FCF per Share"),
-                (68, "ocf_per_share", "OCF per Share"),
+            # Tier 2 KPIs - Working Subset (10 out of 25)
+            # Per-Share Metrics (6 KPIs) - All work
+            (5, "revenue_per_share", "Revenue per Share"),
+            (6, "eps", "Earnings per Share"),
+            (7, "dividend_per_share", "Dividend per Share"),
+            (8, "book_value_per_share", "Book Value per Share"),
+            (23, "fcf_per_share", "FCF per Share"),
+            (68, "ocf_per_share", "OCF per Share"),
 
-                # Additional Cash Flow (4 KPIs) - All work
-                (24, "fcf_margin_pct", "FCF Margin %"),
-                (27, "earnings_fcf", "Earnings/FCF"),
-                (62, "ocf", "Operating Cash Flow"),
-                (64, "capex", "Capex"),
+            # Additional Cash Flow (4 KPIs) - All work
+            (24, "fcf_margin_pct", "FCF Margin %"),
+            (27, "earnings_fcf", "Earnings/FCF"),
+            (62, "ocf", "Operating Cash Flow"),
+            (64, "capex", "Capex"),
 
-                # REMOVED: Quality Scores (0/3 working)
-                # - F-Score, Magic Formula, Earnings Stability all fail with Error 400
-                # These are available from holdings endpoints or need to be calculated
+            # Tier 3 KPIs - Working Subset (7 out of 20)
+            # Additional Valuation (2 KPIs) - All work
+            (19, "peg", "PEG Ratio"),
+            (20, "dividend_payout", "Dividend Payout %"),
 
-                # REMOVED: Technical Indicators (0/5 working)
-                # - Performance, Total Return, RSI, Volatility, Volume all fail
-                # These require daily/real-time data, not annual aggregates
-                # Can be calculated from stockprices_*.json files we already fetch
+            # Additional Absolute Metrics (5 KPIs) - All work
+            (54, "ebitda", "EBITDA"),
+            (57, "total_assets", "Total Assets"),
+            (58, "total_equity", "Total Equity"),
+            (60, "net_debt", "Net Debt"),
+            (61, "num_shares", "Number of Shares"),
+        ]
 
-                # REMOVED: Insider/Ownership (0/7 working)
-                # - All insider and shareholder KPIs fail via /kpis endpoint
-                # This data is available in holdings_insider.json we already fetch
+        print(f"\nFetching {len(kpi_list)} KPIs using batch endpoint...")
 
-                # Tier 3 KPIs - Working Subset (7 out of 20)
-                # Additional Valuation (2 KPIs) - All work
-                (19, "peg", "PEG Ratio"),
-                (20, "dividend_payout", "Dividend Payout %"),
+        for kpi_id, kpi_name, kpi_display_name in kpi_list:
+            print(f"\n  [{self.stats['total']+1}] Fetching KPI: {kpi_display_name} (ID: {kpi_id})...")
+            self.fetch_kpi_batch(kpi_id, kpi_name, kpi_display_name, instrument_ids)
 
-                # Additional Absolute Metrics (5 KPIs) - All work
-                (54, "ebitda", "EBITDA"),
-                (57, "total_assets", "Total Assets"),
-                (58, "total_equity", "Total Equity"),
-                (60, "net_debt", "Net Debt"),
-                (61, "num_shares", "Number of Shares"),
-
-                # REMOVED: Additional Technical (0/4 working)
-                # - MA200 Rank, MA(50)/MA(200), Volatility Std Dev, Volume Trend
-                # Same issue as technical indicators above
-
-                # REMOVED: Short Selling (0/4 working)
-                # - All short selling KPIs fail via /kpis endpoint
-                # This data is available in holdings_shorts.json we already fetch
-
-                # REMOVED: Buybacks (0/3 working)
-                # - All buyback KPIs fail via /kpis endpoint
-                # This data is available in holdings_buyback.json we already fetch
-
-                # REMOVED: Additional Quality (0/2 working)
-                # - Graham Strategy, Cash Flow Stability
-                # May be premium-only or need to be calculated
-            ]
-
-            # Note: We already fetch insider, short selling, and buyback data separately
-            # via the /holdings endpoints. See fetch_global_endpoints() method.
-
-            # Add KPI endpoints for this instrument
-            for kpi_id, kpi_name, kpi_display_name in kpi_endpoints:
-                endpoints.append((
-                    f"kpi_{kpi_name}_{inst_id}",
-                    f"/instruments/{inst_id}/kpis/{kpi_id}/year/mean/history",
-                    {},
-                    inst_id,
-                    kpi_display_name  # Add the display name for JSON/DB
-                ))
-
-            # Fetch regular endpoints (without kpi_name)
-            for item in endpoints:
-                if len(item) == 4:
-                    # Regular endpoint (name, endpoint, params, iid)
-                    name, endpoint, params, iid = item
-                    print(f"\n  [{self.stats['total']+1}] Fetching {name}...")
-                    self.fetch_endpoint(name, endpoint, params, iid)
-                elif len(item) == 5:
-                    # KPI endpoint (name, endpoint, params, iid, kpi_display_name)
-                    name, endpoint, params, iid, kpi_display_name = item
-                    print(f"\n  [{self.stats['total']+1}] Fetching {name}...")
-                    self.fetch_endpoint(name, endpoint, params, iid, kpi_name=kpi_display_name)
-
-        # Fetch array-based endpoints (multiple stocks at once)
-        print(f"\n--- Multi-Stock Endpoints ---")
+        # =================================================================
+        # PART 3: Multi-stock array endpoints
+        # =================================================================
+        print(f"\n--- Multi-Stock Array Endpoints ---")
         inst_list = ",".join(str(i) for i in instrument_ids)
 
         array_endpoints = [
