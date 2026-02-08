@@ -286,11 +286,12 @@ class BorsdataFetcher:
                 # Data unchanged - just update timestamp of existing record
                 self.cursor.execute("""
                     UPDATE api_raw_data
-                    SET fetch_timestamp = %s
+                    SET fetch_timestamp = %s,
+                        kpi_name = COALESCE(%s, kpi_name)
                     WHERE endpoint_name = %s
                     AND (instrument_id = %s OR (instrument_id IS NULL AND %s IS NULL))
                     AND raw_data = %s
-                """, (datetime.now(), name, instrument_id, instrument_id, Json(data)))
+                """, (datetime.now(), kpi_name, name, instrument_id, instrument_id, Json(data)))
                 print(f"    ℹ Data unchanged - updated timestamp only")
             else:
                 # Data changed (or new) - insert new record
@@ -423,6 +424,7 @@ class BorsdataFetcher:
             instrument_ids: List of all instrument IDs to fetch
             skip_if_exists: If True, skip if data already exists
         """
+        print(f"    DEBUG: fetch_kpi_batch called for kpi_id={kpi_id}, kpi_name={kpi_name}")
         self.stats['total'] += 1
 
         # Build the batch endpoint with instList parameter
@@ -431,6 +433,7 @@ class BorsdataFetcher:
         params = {"instList": inst_list}
 
         endpoint_name = f"kpi_{kpi_name}_batch"
+        print(f"    DEBUG: endpoint_name={endpoint_name}, endpoint={endpoint}")
 
         # Check if we already have recent data for this batch endpoint
         if skip_if_exists and self.skip_existing and self.db_enabled:
@@ -439,13 +442,17 @@ class BorsdataFetcher:
                 self.stats['skipped'] += 1
                 return True
 
+        print(f"    DEBUG: About to call make_request for {endpoint}")
         data, error = self.make_request(endpoint, params)
+        print(f"    DEBUG: make_request returned: data={data is not None}, error={error}")
 
         if data is not None:
             self.stats['successful'] += 1
+            print(f"    DEBUG: Data received, db_enabled={self.db_enabled}")
 
             # Save the batch response to DB with instrument_id=None (batch data)
             if self.db_enabled:
+                print(f"    DEBUG: About to save_to_db for {endpoint_name}")
                 self.save_to_db(endpoint_name, endpoint, data, error, None, params, kpi_display_name)
                 print(f"    ✓ Batch KPI {kpi_display_name} saved to database ({len(instrument_ids)} instruments)")
 
@@ -471,9 +478,12 @@ class BorsdataFetcher:
         else:
             self.stats['failed'] += 1
             print(f"    ✗ Error: {error}")
+            print(f"    DEBUG: KPI request failed, db_enabled={self.db_enabled}")
             # Save error to DB for audit trail (consistent with fetch_endpoint)
             if self.db_enabled:
+                print(f"    DEBUG: Saving error to DB for {endpoint_name}")
                 self.save_to_db(endpoint_name, endpoint, data, error, None, params, kpi_display_name)
+                print(f"    DEBUG: Error saved to DB")
             return False
 
     def get_nordic_instruments(self) -> List[int]:
@@ -566,6 +576,10 @@ class BorsdataFetcher:
                 print(f"\n    [{self.stats['total']+1}] Fetching {name}...")
                 self.fetch_endpoint(name, endpoint, params, iid)
 
+        print("\n" + "="*70)
+        print("DEBUG: PART 1 COMPLETED - Per-instrument endpoints done")
+        print("="*70)
+
         # =================================================================
         # PART 2: Batch KPI fetching (OPTIMIZED!)
         # Fetch each KPI for ALL instruments in a single API call
@@ -573,8 +587,11 @@ class BorsdataFetcher:
         # For 700 instruments × 52 KPIs: 36,400 calls → 52 calls
         # =================================================================
         print("\n" + "="*70)
+        print(f"DEBUG: Entering PART 2 - KPI Batch Fetching")
         print(f"FETCHING BATCH KPIs FOR ALL {len(instrument_ids)} INSTRUMENTS")
         print("="*70)
+        print(f"DEBUG: instrument_ids count = {len(instrument_ids)}")
+        print(f"DEBUG: First few instrument_ids = {instrument_ids[:5] if len(instrument_ids) > 5 else instrument_ids}")
         print(f"Using batch endpoint: /instruments/kpis/{{kpi_id}}/year/mean/history?instList=...")
         print(f"This fetches one KPI for ALL instruments in a single API call!")
 
@@ -657,11 +674,24 @@ class BorsdataFetcher:
             (61, "num_shares", "Number of Shares"),
         ]
 
-        print(f"\nFetching {len(kpi_list)} KPIs using batch endpoint...")
+        print(f"\nDEBUG: kpi_list has {len(kpi_list)} KPIs")
+        print(f"Fetching {len(kpi_list)} KPIs using batch endpoint...")
 
-        for kpi_id, kpi_name, kpi_display_name in kpi_list:
-            print(f"\n  [{self.stats['total']+1}] Fetching KPI: {kpi_display_name} (ID: {kpi_id})...")
-            self.fetch_kpi_batch(kpi_id, kpi_name, kpi_display_name, instrument_ids)
+        for idx, (kpi_id, kpi_name, kpi_display_name) in enumerate(kpi_list):
+            print(f"\n  DEBUG: KPI loop iteration {idx+1}/{len(kpi_list)}")
+            print(f"  [{self.stats['total']+1}] Fetching KPI: {kpi_display_name} (ID: {kpi_id})...")
+            try:
+                self.fetch_kpi_batch(kpi_id, kpi_name, kpi_display_name, instrument_ids)
+                print(f"  DEBUG: fetch_kpi_batch completed for {kpi_display_name}")
+            except Exception as e:
+                print(f"  DEBUG: EXCEPTION in fetch_kpi_batch: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        print("\n" + "="*70)
+        print("DEBUG: PART 2 COMPLETED - KPI batch fetching done")
+        print(f"DEBUG: Stats so far - total={self.stats['total']}, successful={self.stats['successful']}, failed={self.stats['failed']}")
+        print("="*70)
 
         # =================================================================
         # PART 3: Multi-stock array endpoints
