@@ -52,7 +52,13 @@ class MLTrainer:
             # Dividend
             'dividend_payout',
             # Absolute (scaled)
-            'earnings', 'revenue', 'ebitda', 'total_assets', 'total_equity', 'net_debt', 'num_shares'
+            'earnings', 'revenue', 'ebitda', 'total_assets', 'total_equity', 'net_debt', 'num_shares',
+            # Pre-report price features
+            'price_change_5d', 'price_change_10d', 'price_change_20d', 'price_change_30d',
+            'volume_ratio_5d_20d',
+            'volatility_5d', 'volatility_20d',
+            'was_rising_5d', 'was_rising_10d', 'was_rising_20d',
+            'pct_from_20d_high', 'pct_from_20d_low',
         ]
 
     def connect(self):
@@ -97,14 +103,10 @@ class MLTrainer:
         df_clean = df[df[target_col].notna()].copy()
         print(f"  Rows with valid target: {len(df_clean)}")
 
-        # Select features
-        X = df_clean[self.feature_cols].copy()
+        # Select features (drop any not present in the dataframe)
+        available_cols = [c for c in self.feature_cols if c in df_clean.columns]
+        X = df_clean[available_cols].copy()
         y = df_clean[target_col].copy()
-
-        # Handle missing values in features
-        print(f"  Missing values before: {X.isna().sum().sum()}")
-        X = X.fillna(X.median())  # Simple median imputation
-        print(f"  Missing values after: {X.isna().sum().sum()}")
 
         # Split by time (not random!) - use early years for train, later for test
         # This prevents data leakage
@@ -120,12 +122,19 @@ class MLTrainer:
         print(f"  Train set: {len(X_train)} rows (years < {split_year:.0f})")
         print(f"  Test set: {len(X_test)} rows (years >= {split_year:.0f})")
 
+        # Impute missing values using training set medians only (avoid leakage)
+        train_medians = X_train.median()
+        print(f"  Missing values before imputation: {X_train.isna().sum().sum()} (train), {X_test.isna().sum().sum()} (test)")
+        X_train = X_train.fillna(train_medians)
+        X_test = X_test.fillna(train_medians)
+        print(f"  Missing values after imputation: {X_train.isna().sum().sum()} (train), {X_test.isna().sum().sum()} (test)")
+
         # Scale features
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
-        return X_train_scaled, X_test_scaled, y_train, y_test, scaler, df_clean
+        return X_train_scaled, X_test_scaled, y_train, y_test, scaler, df_clean, available_cols
 
     def train_dividend_growth_model(self):
         """Train regression model to predict next year dividend growth %."""
@@ -136,7 +145,7 @@ class MLTrainer:
         df = self.load_training_data()
 
         # Prepare data
-        X_train, X_test, y_train, y_test, scaler, df_clean = self.prepare_features(
+        X_train, X_test, y_train, y_test, scaler, df_clean, used_cols = self.prepare_features(
             df, 'next_year_dividend_growth'
         )
 
@@ -174,7 +183,7 @@ class MLTrainer:
         # Feature importance
         print("\nTop 10 Most Important Features:")
         feature_importance = pd.DataFrame({
-            'feature': self.feature_cols,
+            'feature': used_cols,
             'importance': model.feature_importances_
         }).sort_values('importance', ascending=False)
 
@@ -202,7 +211,7 @@ class MLTrainer:
         df = self.load_training_data()
 
         # Prepare data
-        X_train, X_test, y_train, y_test, scaler, df_clean = self.prepare_features(
+        X_train, X_test, y_train, y_test, scaler, df_clean, used_cols = self.prepare_features(
             df, 'dividend_increased'
         )
 
@@ -256,7 +265,7 @@ class MLTrainer:
         # Feature importance
         print("\nTop 10 Most Important Features:")
         feature_importance = pd.DataFrame({
-            'feature': self.feature_cols,
+            'feature': used_cols,
             'importance': model.feature_importances_
         }).sort_values('importance', ascending=False)
 
