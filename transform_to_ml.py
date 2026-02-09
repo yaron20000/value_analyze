@@ -36,37 +36,51 @@ class MLTransformer:
         # KPI ID to column name mapping (matching Borsdata API IDs from fetch_and_store.py)
         self.kpi_mapping = {
             # Valuation
-            2: 'pe_ratio',       # P/E
-            3: 'ps_ratio',       # P/S
-            4: 'pb_ratio',       # P/B
-            11: 'ev_ebitda',     # EV/EBITDA
-            19: 'peg_ratio',     # PEG Ratio
-            15: 'ev_sales',      # EV/S
+            1: 'dividend_yield', # Dividend Yield
+            2: 'pe_ratio',      # P/E
+            3: 'ps_ratio',      # P/S
+            4: 'pb_ratio',      # P/B
+            10: 'ev_ebit',      # EV/EBIT
+            11: 'ev_ebitda',    # EV/EBITDA
+            13: 'ev_fcf',       # EV/FCF
+            19: 'peg_ratio',    # PEG Ratio
+            15: 'ev_sales',     # EV/S
 
             # Profitability & Returns
-            33: 'roe',           # Return on Equity
-            34: 'roa',           # Return on Assets
-            32: 'ebitda_margin', # EBITDA Margin
-            29: 'operating_margin',  # Operating Margin
-            28: 'gross_margin',  # Gross Margin
-            30: 'net_margin',    # Profit Margin
+            33: 'roe',              # Return on Equity
+            34: 'roa',              # Return on Assets
+            36: 'roc',              # Return on Capital
+            37: 'roic',             # Return on Invested Capital
+            32: 'ebitda_margin',    # EBITDA Margin
+            29: 'operating_margin', # Operating Margin
+            28: 'gross_margin',     # Gross Margin
+            30: 'net_margin',       # Profit Margin
+            24: 'fcf_margin_pct',   # FCF Margin % (KPI 24, distinct from KPI 31)
+            51: 'ocf_margin',       # OCF Margin
 
             # Financial Health
-            40: 'debt_equity',   # Debt to Equity
-            39: 'equity_ratio',  # Equity Ratio
-            44: 'current_ratio', # Current Ratio
+            40: 'debt_equity',      # Debt to Equity
+            39: 'equity_ratio',     # Equity Ratio
+            44: 'current_ratio',    # Current Ratio
+            41: 'net_debt_pct',     # Net Debt %
+            42: 'net_debt_ebitda',  # Net Debt/EBITDA
+            46: 'cash_pct',         # Cash %
 
             # Growth
-            94: 'revenue_growth',    # Revenue Growth
-            97: 'earnings_growth',   # Earnings Growth
-            98: 'dividend_growth',   # Dividend Growth
+            94: 'revenue_growth',      # Revenue Growth
+            97: 'earnings_growth',     # Earnings Growth
+            98: 'dividend_growth',     # Dividend Growth
+            96: 'ebit_growth',         # EBIT Growth
+            99: 'book_value_growth',   # Book Value Growth
+            100: 'assets_growth',      # Assets Growth
 
             # Per Share
-            6: 'eps',                    # Earnings per Share
-            7: 'dividend_per_share',     # Dividend per Share
-            8: 'book_value_per_share',   # Book Value per Share
-            23: 'fcf_per_share',         # FCF per Share
-            68: 'ocf_per_share',         # OCF per Share
+            5: 'revenue_per_share',        # Revenue per Share
+            6: 'eps',                      # Earnings per Share
+            7: 'dividend_per_share',       # Dividend per Share
+            8: 'book_value_per_share',     # Book Value per Share
+            23: 'fcf_per_share',           # FCF per Share
+            68: 'ocf_per_share',           # OCF per Share
 
             # Cash Flow
             31: 'fcf_margin',    # FCF Margin
@@ -78,13 +92,16 @@ class MLTransformer:
             20: 'dividend_payout',  # Dividend Payout %
 
             # Absolute Metrics
-            56: 'earnings',      # Earnings
-            53: 'revenue',       # Revenue
-            54: 'ebitda',        # EBITDA
-            57: 'total_assets',  # Total Assets
-            58: 'total_equity',  # Total Equity
-            60: 'net_debt',      # Net Debt
-            61: 'num_shares',    # Number of Shares
+            56: 'earnings',          # Earnings
+            53: 'revenue',           # Revenue
+            54: 'ebitda',            # EBITDA
+            57: 'total_assets',      # Total Assets
+            58: 'total_equity',      # Total Equity
+            60: 'net_debt',          # Net Debt
+            61: 'num_shares',        # Number of Shares
+            49: 'enterprise_value',  # Enterprise Value
+            50: 'market_cap',        # Market Cap
+            63: 'fcf',              # Free Cash Flow (absolute)
         }
 
     def connect(self):
@@ -195,14 +212,15 @@ class MLTransformer:
         INSERT INTO ml_features (
             instrument_id, year, period,
             company_name, sector, market, country,
-            pe_ratio, ps_ratio, pb_ratio, ev_ebitda, peg_ratio, ev_sales,
-            roe, roa, ebitda_margin, operating_margin, gross_margin, net_margin,
-            debt_equity, equity_ratio, current_ratio,
-            revenue_growth, earnings_growth, dividend_growth,
-            eps, dividend_per_share, book_value_per_share, fcf_per_share, ocf_per_share,
+            dividend_yield, pe_ratio, ps_ratio, pb_ratio, ev_ebit, ev_ebitda, ev_fcf, peg_ratio, ev_sales,
+            roe, roa, roc, roic, ebitda_margin, operating_margin, gross_margin, net_margin, fcf_margin_pct, ocf_margin,
+            debt_equity, equity_ratio, current_ratio, net_debt_pct, net_debt_ebitda, cash_pct,
+            revenue_growth, earnings_growth, dividend_growth, ebit_growth, book_value_growth, assets_growth,
+            revenue_per_share, eps, dividend_per_share, book_value_per_share, fcf_per_share, ocf_per_share,
             fcf_margin, earnings_fcf, ocf, capex,
             dividend_payout,
             earnings, revenue, ebitda, total_assets, total_equity, net_debt, num_shares,
+            enterprise_value, market_cap, fcf,
             fetch_date
         )
         SELECT
@@ -213,35 +231,50 @@ class MLTransformer:
             %s as sector,
             %s as market,
             %s as country,
-            p.pe_ratio, p.ps_ratio, p.pb_ratio, p.ev_ebitda, p.peg_ratio, p.ev_sales,
-            p.roe, p.roa, p.ebitda_margin, p.operating_margin, p.gross_margin, p.net_margin,
-            p.debt_equity, p.equity_ratio, p.current_ratio,
-            p.revenue_growth, p.earnings_growth, p.dividend_growth,
-            p.eps, p.dividend_per_share, p.book_value_per_share, p.fcf_per_share, p.ocf_per_share,
+            p.dividend_yield, p.pe_ratio, p.ps_ratio, p.pb_ratio, p.ev_ebit, p.ev_ebitda, p.ev_fcf, p.peg_ratio, p.ev_sales,
+            p.roe, p.roa, p.roc, p.roic, p.ebitda_margin, p.operating_margin, p.gross_margin, p.net_margin, p.fcf_margin_pct, p.ocf_margin,
+            p.debt_equity, p.equity_ratio, p.current_ratio, p.net_debt_pct, p.net_debt_ebitda, p.cash_pct,
+            p.revenue_growth, p.earnings_growth, p.dividend_growth, p.ebit_growth, p.book_value_growth, p.assets_growth,
+            p.revenue_per_share, p.eps, p.dividend_per_share, p.book_value_per_share, p.fcf_per_share, p.ocf_per_share,
             p.fcf_margin, p.earnings_fcf, p.ocf, p.capex,
             p.dividend_payout,
             p.earnings, p.revenue, p.ebitda, p.total_assets, p.total_equity, p.net_debt, p.num_shares,
+            p.enterprise_value, p.market_cap, p.fcf,
             p.fetch_date
         FROM pivoted p
         ON CONFLICT (instrument_id, year, period) DO UPDATE SET
+            dividend_yield = EXCLUDED.dividend_yield,
             pe_ratio = EXCLUDED.pe_ratio,
             ps_ratio = EXCLUDED.ps_ratio,
             pb_ratio = EXCLUDED.pb_ratio,
+            ev_ebit = EXCLUDED.ev_ebit,
             ev_ebitda = EXCLUDED.ev_ebitda,
+            ev_fcf = EXCLUDED.ev_fcf,
             peg_ratio = EXCLUDED.peg_ratio,
             ev_sales = EXCLUDED.ev_sales,
             roe = EXCLUDED.roe,
             roa = EXCLUDED.roa,
+            roc = EXCLUDED.roc,
+            roic = EXCLUDED.roic,
             ebitda_margin = EXCLUDED.ebitda_margin,
             operating_margin = EXCLUDED.operating_margin,
             gross_margin = EXCLUDED.gross_margin,
             net_margin = EXCLUDED.net_margin,
+            fcf_margin_pct = EXCLUDED.fcf_margin_pct,
+            ocf_margin = EXCLUDED.ocf_margin,
             debt_equity = EXCLUDED.debt_equity,
             equity_ratio = EXCLUDED.equity_ratio,
             current_ratio = EXCLUDED.current_ratio,
+            net_debt_pct = EXCLUDED.net_debt_pct,
+            net_debt_ebitda = EXCLUDED.net_debt_ebitda,
+            cash_pct = EXCLUDED.cash_pct,
             revenue_growth = EXCLUDED.revenue_growth,
             earnings_growth = EXCLUDED.earnings_growth,
             dividend_growth = EXCLUDED.dividend_growth,
+            ebit_growth = EXCLUDED.ebit_growth,
+            book_value_growth = EXCLUDED.book_value_growth,
+            assets_growth = EXCLUDED.assets_growth,
+            revenue_per_share = EXCLUDED.revenue_per_share,
             eps = EXCLUDED.eps,
             dividend_per_share = EXCLUDED.dividend_per_share,
             book_value_per_share = EXCLUDED.book_value_per_share,
@@ -259,6 +292,9 @@ class MLTransformer:
             total_equity = EXCLUDED.total_equity,
             net_debt = EXCLUDED.net_debt,
             num_shares = EXCLUDED.num_shares,
+            enterprise_value = EXCLUDED.enterprise_value,
+            market_cap = EXCLUDED.market_cap,
+            fcf = EXCLUDED.fcf,
             fetch_date = EXCLUDED.fetch_date
         """
 
@@ -324,8 +360,8 @@ class MLTransformer:
                 year,
                 dividend_per_share as dividend,
                 LEAD(dividend_per_share, 1) OVER (PARTITION BY instrument_id ORDER BY year) as next_year_dividend,
-                LEAD(dividend_per_share, 2) OVER (PARTITION BY instrument_id ORDER BY year) as next_2year_dividend,
-                LEAD(dividend_per_share, 3) OVER (PARTITION BY instrument_id ORDER BY year) as next_3year_dividend
+                LEAD(dividend_per_share, 3) OVER (PARTITION BY instrument_id ORDER BY year) as next_3year_dividend,
+                LEAD(dividend_per_share, 5) OVER (PARTITION BY instrument_id ORDER BY year) as next_5year_dividend
             FROM ml_features
             {where_clause}
         )
@@ -334,6 +370,7 @@ class MLTransformer:
             year,
             next_year_dividend_growth,
             next_3year_avg_dividend_growth,
+            next_5year_avg_dividend_growth,
             dividend_increased,
             calculated_date
         )
@@ -354,6 +391,13 @@ class MLTransformer:
                 ELSE NULL
             END as next_3year_avg_dividend_growth,
 
+            -- Average dividend growth over 5 years
+            CASE
+                WHEN dividend > 0 AND next_5year_dividend IS NOT NULL
+                THEN (((next_5year_dividend - dividend) / dividend) / 5) * 100
+                ELSE NULL
+            END as next_5year_avg_dividend_growth,
+
             -- Binary: did dividend increase?
             CASE
                 WHEN next_year_dividend > dividend THEN TRUE
@@ -367,6 +411,7 @@ class MLTransformer:
         ON CONFLICT (instrument_id, year) DO UPDATE SET
             next_year_dividend_growth = EXCLUDED.next_year_dividend_growth,
             next_3year_avg_dividend_growth = EXCLUDED.next_3year_avg_dividend_growth,
+            next_5year_avg_dividend_growth = EXCLUDED.next_5year_avg_dividend_growth,
             dividend_increased = EXCLUDED.dividend_increased,
             calculated_date = EXCLUDED.calculated_date
         """
@@ -374,7 +419,136 @@ class MLTransformer:
         self.cursor.execute(query)
         rows = self.cursor.rowcount
         self.conn.commit()
-        print(f"✓ Calculated targets for {rows} rows")
+        print(f"✓ Calculated dividend targets for {rows} rows")
+
+    def calculate_return_targets(self, instrument_id: int = None):
+        """
+        Calculate stock return targets using ml_stock_prices data.
+
+        For each (instrument, year), calculate:
+        - next_year_return: % return from end-of-year Y to end-of-year Y+1
+        - next_3year_return: % return from end-of-year Y to end-of-year Y+3
+        - next_5year_return: % return from end-of-year Y to end-of-year Y+5
+        - next_year_outperformed: did stock beat median return that year?
+        """
+        print(f"Calculating stock return targets{f' for instrument {instrument_id}' if instrument_id else ''}...")
+
+        where_clause = ""
+        if instrument_id:
+            where_clause = f"AND yr.instrument_id = {instrument_id}"
+
+        query = f"""
+        WITH yearly_prices AS (
+            -- Get the last trading day's close price for each (instrument, calendar year)
+            SELECT DISTINCT ON (instrument_id, EXTRACT(YEAR FROM date))
+                instrument_id,
+                EXTRACT(YEAR FROM date)::integer as year,
+                close as year_end_price
+            FROM ml_stock_prices
+            WHERE close IS NOT NULL AND close > 0
+            ORDER BY instrument_id, EXTRACT(YEAR FROM date), date DESC
+        ),
+        returns AS (
+            SELECT
+                yr.instrument_id,
+                yr.year,
+                CASE WHEN y1.year_end_price IS NOT NULL
+                    THEN ((y1.year_end_price - yr.year_end_price) / yr.year_end_price) * 100
+                END as next_year_return,
+                CASE WHEN y3.year_end_price IS NOT NULL
+                    THEN ((y3.year_end_price - yr.year_end_price) / yr.year_end_price) * 100
+                END as next_3year_return,
+                CASE WHEN y5.year_end_price IS NOT NULL
+                    THEN ((y5.year_end_price - yr.year_end_price) / yr.year_end_price) * 100
+                END as next_5year_return
+            FROM yearly_prices yr
+            LEFT JOIN yearly_prices y1 ON yr.instrument_id = y1.instrument_id AND y1.year = yr.year + 1
+            LEFT JOIN yearly_prices y3 ON yr.instrument_id = y3.instrument_id AND y3.year = yr.year + 3
+            LEFT JOIN yearly_prices y5 ON yr.instrument_id = y5.instrument_id AND y5.year = yr.year + 5
+            WHERE 1=1 {where_clause}
+        ),
+        market_median AS (
+            SELECT
+                year,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY next_year_return) as median_return
+            FROM returns
+            WHERE next_year_return IS NOT NULL
+            GROUP BY year
+        )
+        UPDATE ml_targets t
+        SET
+            next_year_return = r.next_year_return,
+            next_3year_return = r.next_3year_return,
+            next_5year_return = r.next_5year_return,
+            next_year_outperformed = (r.next_year_return > m.median_return),
+            calculated_date = NOW()
+        FROM returns r
+        LEFT JOIN market_median m ON r.year = m.year
+        WHERE t.instrument_id = r.instrument_id AND t.year = r.year
+        """
+
+        self.cursor.execute(query)
+        updated = self.cursor.rowcount
+
+        # Also insert return targets for instruments that have prices but no dividend data
+        # (they won't have rows in ml_targets yet)
+        insert_query = f"""
+        WITH yearly_prices AS (
+            SELECT DISTINCT ON (instrument_id, EXTRACT(YEAR FROM date))
+                instrument_id,
+                EXTRACT(YEAR FROM date)::integer as year,
+                close as year_end_price
+            FROM ml_stock_prices
+            WHERE close IS NOT NULL AND close > 0
+            ORDER BY instrument_id, EXTRACT(YEAR FROM date), date DESC
+        ),
+        returns AS (
+            SELECT
+                yr.instrument_id,
+                yr.year,
+                CASE WHEN y1.year_end_price IS NOT NULL
+                    THEN ((y1.year_end_price - yr.year_end_price) / yr.year_end_price) * 100
+                END as next_year_return,
+                CASE WHEN y3.year_end_price IS NOT NULL
+                    THEN ((y3.year_end_price - yr.year_end_price) / yr.year_end_price) * 100
+                END as next_3year_return,
+                CASE WHEN y5.year_end_price IS NOT NULL
+                    THEN ((y5.year_end_price - yr.year_end_price) / yr.year_end_price) * 100
+                END as next_5year_return
+            FROM yearly_prices yr
+            LEFT JOIN yearly_prices y1 ON yr.instrument_id = y1.instrument_id AND y1.year = yr.year + 1
+            LEFT JOIN yearly_prices y3 ON yr.instrument_id = y3.instrument_id AND y3.year = yr.year + 3
+            LEFT JOIN yearly_prices y5 ON yr.instrument_id = y5.instrument_id AND y5.year = yr.year + 5
+            WHERE 1=1 {where_clause}
+        ),
+        market_median AS (
+            SELECT
+                year,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY next_year_return) as median_return
+            FROM returns
+            WHERE next_year_return IS NOT NULL
+            GROUP BY year
+        )
+        INSERT INTO ml_targets (
+            instrument_id, year,
+            next_year_return, next_3year_return, next_5year_return,
+            next_year_outperformed, calculated_date
+        )
+        SELECT
+            r.instrument_id, r.year,
+            r.next_year_return, r.next_3year_return, r.next_5year_return,
+            (r.next_year_return > m.median_return),
+            NOW()
+        FROM returns r
+        LEFT JOIN market_median m ON r.year = m.year
+        WHERE r.next_year_return IS NOT NULL
+        ON CONFLICT (instrument_id, year) DO NOTHING
+        """
+
+        self.cursor.execute(insert_query)
+        inserted = self.cursor.rowcount
+        self.conn.commit()
+        print(f"✓ Stock return targets: {updated} updated, {inserted} new rows")
 
     def transform_stock_prices(self, instrument_id: int = None):
         """Extract daily stock prices from JSONB."""
@@ -630,6 +804,7 @@ class MLTransformer:
             self.transform_kpi_data(instrument_id)
             self.calculate_targets(instrument_id)
             self.transform_stock_prices(instrument_id)
+            self.calculate_return_targets(instrument_id)
             self.calculate_pre_report_features(instrument_id)
 
             duration = (datetime.now() - start_time).total_seconds()
@@ -648,9 +823,17 @@ class MLTransformer:
             stats = self.cursor.fetchone()
             print(f"ML Features: {stats[0]} rows, {stats[1]} instruments, years {stats[2]}-{stats[3]}")
 
-            self.cursor.execute("SELECT COUNT(*) FROM ml_targets WHERE next_year_dividend_growth IS NOT NULL")
-            target_count = self.cursor.fetchone()[0]
-            print(f"ML Targets: {target_count} rows with dividend growth targets")
+            self.cursor.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(next_year_dividend_growth) as has_dividend,
+                    COUNT(next_year_return) as has_return,
+                    COUNT(next_year_outperformed) as has_outperformed
+                FROM ml_targets
+            """)
+            t = self.cursor.fetchone()
+            print(f"ML Targets: {t[0]} total rows, {t[1]} with dividend targets, "
+                  f"{t[2]} with return targets, {t[3]} with outperformance")
 
             self.cursor.execute("SELECT COUNT(*) FROM ml_stock_prices")
             price_count = self.cursor.fetchone()[0]

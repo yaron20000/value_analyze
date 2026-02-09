@@ -410,12 +410,30 @@ class BorsdataFetcher:
             print(f"    ✓ Error logged to {filepath}")
             return False
 
+    # Max instruments per batch KPI request to avoid API URL length limits
+    KPI_BATCH_CHUNK_SIZE = 100
+
+    def _get_batch_instrument_count(self, endpoint_name: str) -> int:
+        """Count how many instruments are in an existing KPI batch record."""
+        try:
+            self.cursor.execute("""
+                SELECT jsonb_array_length(raw_data->'kpisList')
+                FROM api_raw_data
+                WHERE endpoint_name = %s AND success = true
+                ORDER BY fetch_timestamp DESC
+                LIMIT 1
+            """, (endpoint_name,))
+            row = self.cursor.fetchone()
+            return row[0] if row and row[0] else 0
+        except Exception:
+            return 0
+
     def fetch_kpi_batch(self, kpi_id: int, kpi_name: str, kpi_display_name: str,
                         instrument_ids: List[int], skip_if_exists: bool = True):
-        """Fetch a single KPI for ALL instruments in one API call.
+        """Fetch a single KPI for ALL instruments, chunked to avoid API URL limits.
 
-        This is much more efficient than fetching per-instrument.
-        Reduces API calls from (num_instruments × num_kpis) to just (num_kpis).
+        Splits instrument_ids into chunks of KPI_BATCH_CHUNK_SIZE and merges
+        results, since the Borsdata API silently truncates long instList params.
 
         Args:
             kpi_id: The KPI ID to fetch
@@ -424,67 +442,76 @@ class BorsdataFetcher:
             instrument_ids: List of all instrument IDs to fetch
             skip_if_exists: If True, skip if data already exists
         """
-        print(f"    DEBUG: fetch_kpi_batch called for kpi_id={kpi_id}, kpi_name={kpi_name}")
         self.stats['total'] += 1
 
-        # Build the batch endpoint with instList parameter
-        inst_list = ",".join(str(i) for i in instrument_ids)
         endpoint = f"/instruments/kpis/{kpi_id}/year/mean/history"
-        params = {"instList": inst_list}
-
         endpoint_name = f"kpi_{kpi_name}_batch"
-        print(f"    DEBUG: endpoint_name={endpoint_name}, endpoint={endpoint}")
 
-        # Check if we already have recent data for this batch endpoint
+        # Check if we already have recent data with sufficient instrument coverage
         if skip_if_exists and self.skip_existing and self.db_enabled:
             if self.check_existing_data(endpoint_name, None):
-                print(f"    ⏭ Skipping - recent data already exists (within 24 hours)")
-                self.stats['skipped'] += 1
-                return True
+                # Also verify the existing batch covers enough instruments
+                existing_count = self._get_batch_instrument_count(endpoint_name)
+                if existing_count >= len(instrument_ids) * 0.8:
+                    print(f"    ⏭ Skipping - recent data exists ({existing_count} instruments)")
+                    self.stats['skipped'] += 1
+                    return True
+                else:
+                    print(f"    ↻ Re-fetching - existing data has {existing_count} instruments, "
+                          f"need {len(instrument_ids)}")
 
-        print(f"    DEBUG: About to call make_request for {endpoint}")
-        data, error = self.make_request(endpoint, params)
-        print(f"    DEBUG: make_request returned: data={data is not None}, error={error}")
+        # Split instrument_ids into chunks to avoid API URL length limits
+        chunks = [
+            instrument_ids[i:i + self.KPI_BATCH_CHUNK_SIZE]
+            for i in range(0, len(instrument_ids), self.KPI_BATCH_CHUNK_SIZE)
+        ]
 
-        if data is not None:
-            self.stats['successful'] += 1
-            print(f"    DEBUG: Data received, db_enabled={self.db_enabled}")
+        merged_kpis_list = []
+        any_success = False
 
-            # Save the batch response to DB with instrument_id=None (batch data)
-            if self.db_enabled:
-                print(f"    DEBUG: About to save_to_db for {endpoint_name}")
-                self.save_to_db(endpoint_name, endpoint, data, error, None, params, kpi_display_name)
-                print(f"    ✓ Batch KPI {kpi_display_name} saved to database ({len(instrument_ids)} instruments)")
+        for chunk_idx, chunk in enumerate(chunks):
+            inst_list = ",".join(str(i) for i in chunk)
+            params = {"instList": inst_list}
 
-            # Also parse and save individual instrument data for easier querying
-            if self.db_enabled and 'values' in data:
-                # The batch response has format: {"values": [{"i": inst_id, "n": kpi_id, "v": value, "y": year}, ...]}
-                values_by_inst = {}
-                for item in data.get('values', []):
-                    inst_id = item.get('i')
-                    if inst_id not in values_by_inst:
-                        values_by_inst[inst_id] = []
-                    values_by_inst[inst_id].append(item)
+            data, error = self.make_request(endpoint, params)
 
-                # Save each instrument's data separately for easier querying
-                for inst_id, values in values_by_inst.items():
-                    inst_data = {"values": values}
-                    inst_name = f"kpi_{kpi_name}_{inst_id}"
-                    self.save_to_db(inst_name, endpoint, inst_data, None, inst_id, params, kpi_display_name)
+            if data is not None and 'kpisList' in data:
+                merged_kpis_list.extend(data.get('kpisList', []))
+                any_success = True
+                if len(chunks) > 1:
+                    print(f"      Chunk {chunk_idx + 1}/{len(chunks)}: "
+                          f"{len(data.get('kpisList', []))} instruments")
+            elif error:
+                print(f"      Chunk {chunk_idx + 1}/{len(chunks)} failed: {error}")
 
-                print(f"    ✓ Parsed into {len(values_by_inst)} individual instrument records")
-
-            return True
-        else:
+        if not any_success:
             self.stats['failed'] += 1
-            print(f"    ✗ Error: {error}")
-            print(f"    DEBUG: KPI request failed, db_enabled={self.db_enabled}")
-            # Save error to DB for audit trail (consistent with fetch_endpoint)
+            print(f"    ✗ All chunks failed for KPI {kpi_display_name}")
             if self.db_enabled:
-                print(f"    DEBUG: Saving error to DB for {endpoint_name}")
-                self.save_to_db(endpoint_name, endpoint, data, error, None, params, kpi_display_name)
-                print(f"    DEBUG: Error saved to DB")
+                self.save_to_db(endpoint_name, endpoint, None, "All chunks failed", None, {}, kpi_display_name)
             return False
+
+        self.stats['successful'] += 1
+
+        # Build merged response matching the original batch format
+        merged_data = {"kpiId": kpi_id, "kpisList": merged_kpis_list}
+
+        # Save the merged batch response to DB
+        if self.db_enabled:
+            self.save_to_db(endpoint_name, endpoint, merged_data, None, None, {}, kpi_display_name)
+            print(f"    ✓ Batch KPI {kpi_display_name}: {len(merged_kpis_list)} instruments "
+                  f"({len(chunks)} chunk{'s' if len(chunks) > 1 else ''})")
+
+            # Also save individual instrument records
+            for entry in merged_kpis_list:
+                inst_id = entry.get('instrument')
+                if inst_id is None:
+                    continue
+                inst_data = {"values": entry.get('values', [])}
+                inst_name = f"kpi_{kpi_name}_{inst_id}"
+                self.save_to_db(inst_name, endpoint, inst_data, None, inst_id, {}, kpi_display_name)
+
+        return True
 
     def get_nordic_instruments(self) -> List[int]:
         """Fetch all instruments and filter for Nordic countries."""

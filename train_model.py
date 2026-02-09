@@ -38,21 +38,28 @@ class MLTrainer:
         # Feature columns for training (exclude identifiers and targets)
         self.feature_cols = [
             # Valuation
-            'pe_ratio', 'ps_ratio', 'pb_ratio', 'ev_ebitda', 'peg_ratio', 'ev_sales',
-            # Profitability
-            'roe', 'roi', 'roa', 'ebitda_margin', 'operating_margin', 'gross_margin', 'net_margin',
+            'dividend_yield', 'pe_ratio', 'ps_ratio', 'pb_ratio',
+            'ev_ebit', 'ev_ebitda', 'ev_fcf', 'peg_ratio', 'ev_sales',
+            # Profitability & Returns
+            'roe', 'roa', 'roc', 'roic',
+            'ebitda_margin', 'operating_margin', 'gross_margin', 'net_margin',
+            'fcf_margin_pct', 'ocf_margin',
             # Financial Health
-            'debt_equity', 'equity_ratio', 'current_ratio', 'quick_ratio', 'interest_coverage',
+            'debt_equity', 'equity_ratio', 'current_ratio',
+            'net_debt_pct', 'net_debt_ebitda', 'cash_pct',
             # Growth (exclude dividend_growth - it's in the target!)
             'revenue_growth', 'earnings_growth',
+            'ebit_growth', 'book_value_growth', 'assets_growth',
             # Per Share
-            'eps', 'dividend_per_share', 'book_value_per_share', 'fcf_per_share', 'ocf_per_share',
+            'revenue_per_share', 'eps', 'dividend_per_share',
+            'book_value_per_share', 'fcf_per_share', 'ocf_per_share',
             # Cash Flow
             'fcf_margin', 'earnings_fcf', 'ocf', 'capex',
             # Dividend
             'dividend_payout',
             # Absolute (scaled)
-            'earnings', 'revenue', 'ebitda', 'total_assets', 'total_equity', 'net_debt', 'num_shares',
+            'earnings', 'revenue', 'ebitda', 'total_assets', 'total_equity',
+            'net_debt', 'num_shares', 'enterprise_value', 'market_cap', 'fcf',
             # Pre-report price features
             'price_change_5d', 'price_change_10d', 'price_change_20d', 'price_change_30d',
             'volume_ratio_5d_20d',
@@ -274,6 +281,128 @@ class MLTrainer:
 
         return model, scaler, feature_importance
 
+    def train_stock_return_model(self):
+        """Train regression model to predict next year stock return %."""
+        print("\n" + "="*70)
+        print("TRAINING: Stock Return Prediction (Regression)")
+        print("="*70)
+
+        df = self.load_training_data()
+
+        # For stock returns, we can also use dividend_growth as a feature
+        X_train, X_test, y_train, y_test, scaler, df_clean, used_cols = self.prepare_features(
+            df, 'next_year_return'
+        )
+
+        print("\nTraining Random Forest Regressor...")
+        model = RandomForestRegressor(
+            n_estimators=200,
+            max_depth=12,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1
+        )
+
+        model.fit(X_train, y_train)
+        print("✓ Model trained")
+
+        # Evaluate
+        train_pred = model.predict(X_train)
+        test_pred = model.predict(X_test)
+
+        train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
+        test_rmse = np.sqrt(mean_squared_error(y_test, test_pred))
+        train_r2 = r2_score(y_train, train_pred)
+        test_r2 = r2_score(y_test, test_pred)
+
+        print("\n" + "="*70)
+        print("RESULTS: Stock Return Prediction")
+        print("="*70)
+        print(f"Training RMSE:   {train_rmse:.2f}%")
+        print(f"Test RMSE:       {test_rmse:.2f}%")
+        print(f"Training R²:     {train_r2:.3f}")
+        print(f"Test R²:         {test_r2:.3f}")
+
+        # Feature importance
+        print("\nTop 10 Most Important Features:")
+        feature_importance = pd.DataFrame({
+            'feature': used_cols,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+        for idx, row in feature_importance.head(10).iterrows():
+            print(f"  {row['feature']:25s} {row['importance']:.4f}")
+
+        return model, scaler, feature_importance
+
+    def train_outperformance_classifier(self):
+        """Train classifier: will stock outperform market median next year?"""
+        print("\n" + "="*70)
+        print("TRAINING: Market Outperformance Classifier (Binary)")
+        print("="*70)
+
+        df = self.load_training_data()
+
+        X_train, X_test, y_train, y_test, scaler, df_clean, used_cols = self.prepare_features(
+            df, 'next_year_outperformed'
+        )
+
+        y_train = y_train.astype(int)
+        y_test = y_test.astype(int)
+
+        print(f"\nClass distribution (train):")
+        print(f"  Underperformed (0): {(y_train == 0).sum()} ({(y_train == 0).mean()*100:.1f}%)")
+        print(f"  Outperformed (1):   {(y_train == 1).sum()} ({(y_train == 1).mean()*100:.1f}%)")
+
+        print("\nTraining Random Forest Classifier...")
+        model = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1,
+            class_weight='balanced'
+        )
+
+        model.fit(X_train, y_train)
+        print("✓ Model trained")
+
+        # Evaluate
+        test_pred = model.predict(X_test)
+        train_pred = model.predict(X_train)
+
+        train_acc = (train_pred == y_train).mean()
+        test_acc = (test_pred == y_test).mean()
+
+        print("\n" + "="*70)
+        print("RESULTS: Market Outperformance Classifier")
+        print("="*70)
+        print(f"Training Accuracy: {train_acc:.3f}")
+        print(f"Test Accuracy:     {test_acc:.3f}")
+
+        print("\nClassification Report (Test Set):")
+        print(classification_report(y_test, test_pred,
+                                   target_names=['Underperformed', 'Outperformed']))
+
+        print("\nConfusion Matrix (Test Set):")
+        cm = confusion_matrix(y_test, test_pred)
+        print(f"  True Negatives:  {cm[0,0]:3d}  |  False Positives: {cm[0,1]:3d}")
+        print(f"  False Negatives: {cm[1,0]:3d}  |  True Positives:  {cm[1,1]:3d}")
+
+        # Feature importance
+        print("\nTop 10 Most Important Features:")
+        feature_importance = pd.DataFrame({
+            'feature': used_cols,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+        for idx, row in feature_importance.head(10).iterrows():
+            print(f"  {row['feature']:25s} {row['importance']:.4f}")
+
+        return model, scaler, feature_importance
+
     def close(self):
         """Close database connection."""
         if self.conn:
@@ -287,7 +416,9 @@ def main():
     parser.add_argument('--db-user', default=os.getenv('DB_USER', 'postgres'))
     parser.add_argument('--db-password', default=os.getenv('DB_PASSWORD'))
     parser.add_argument('--db-port', type=int, default=int(os.getenv('DB_PORT', 5432)))
-    parser.add_argument('--model', choices=['dividend-growth', 'dividend-classifier', 'all'],
+    parser.add_argument('--model', choices=[
+                           'dividend-growth', 'dividend-classifier',
+                           'stock-return', 'outperformance-classifier', 'all'],
                        default='all', help='Which model to train')
 
     args = parser.parse_args()
@@ -315,6 +446,12 @@ def main():
 
         if args.model in ['dividend-classifier', 'all']:
             trainer.train_dividend_classifier()
+
+        if args.model in ['stock-return', 'all']:
+            trainer.train_stock_return_model()
+
+        if args.model in ['outperformance-classifier', 'all']:
+            trainer.train_outperformance_classifier()
 
     finally:
         trainer.close()
