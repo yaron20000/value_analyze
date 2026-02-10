@@ -5,6 +5,7 @@
 
 -- Drop ML tables if they exist
 DROP VIEW IF EXISTS ml_training_data CASCADE;
+DROP TABLE IF EXISTS ml_holdings_features CASCADE;
 DROP TABLE IF EXISTS ml_pre_report_features CASCADE;
 DROP TABLE IF EXISTS ml_targets CASCADE;
 DROP TABLE IF EXISTS ml_stock_prices CASCADE;
@@ -191,6 +192,10 @@ CREATE TABLE ml_targets (
     next_3year_avg_dividend_growth NUMERIC(10,4), -- Avg % dividend growth over 3 years
     next_5year_avg_dividend_growth NUMERIC(10,4), -- Avg % dividend growth over 5 years
 
+    -- Excess return targets (for ranking)
+    next_year_excess_return NUMERIC(10,4),  -- stock return minus market median (%)
+    market_median_return NUMERIC(10,4),     -- market median return that year (%)
+
     -- Classification targets (optional)
     next_year_outperformed BOOLEAN,   -- Did it beat market average?
     dividend_increased BOOLEAN,       -- Did dividend increase?
@@ -206,6 +211,39 @@ CREATE INDEX idx_ml_targets_instrument ON ml_targets(instrument_id);
 CREATE INDEX idx_ml_targets_year ON ml_targets(year);
 
 -- =============================================================================
+-- 4b. HOLDINGS FEATURES TABLE - Insider trading & buyback signals
+-- =============================================================================
+CREATE TABLE ml_holdings_features (
+    instrument_id INTEGER NOT NULL,
+    year INTEGER NOT NULL,
+
+    -- Insider features (aggregated per year from transaction data)
+    insider_net_shares INTEGER,              -- net shares bought (positive=net buying)
+    insider_net_amount NUMERIC(20,2),        -- net currency amount of insider trades
+    insider_buy_count INTEGER,               -- number of buy transactions
+    insider_sell_count INTEGER,              -- number of sell transactions
+    insider_transaction_count INTEGER,       -- total transactions
+    insider_buy_ratio NUMERIC(5,4),          -- buy_count / total_count (1.0 = all buys)
+
+    -- Buyback features (aggregated per year)
+    buyback_total_shares BIGINT,             -- total shares bought back in year
+    buyback_total_amount NUMERIC(20,2),      -- estimated total spent (change * price)
+    buyback_count INTEGER,                   -- number of buyback events in year
+    buyback_shares_pct NUMERIC(10,6),        -- max cumulative % of shares held in year
+
+    -- Metadata
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (instrument_id, year)
+);
+
+CREATE INDEX idx_ml_holdings_instrument ON ml_holdings_features(instrument_id);
+CREATE INDEX idx_ml_holdings_year ON ml_holdings_features(year);
+
+COMMENT ON TABLE ml_holdings_features IS 'Insider trading and buyback signals aggregated per (instrument, year)';
+COMMENT ON COLUMN ml_holdings_features.insider_buy_ratio IS '1.0 = all insider transactions were buys, 0.0 = all sells';
+
+-- =============================================================================
 -- 5. TRAINING DATA VIEW - Ready for ML (join features + targets + pre-report)
 -- =============================================================================
 CREATE VIEW ml_training_data AS
@@ -214,6 +252,8 @@ SELECT
     t.next_year_return,
     t.next_3year_return,
     t.next_5year_return,
+    t.next_year_excess_return,
+    t.market_median_return,
     t.next_year_dividend_growth,
     t.next_3year_avg_dividend_growth,
     t.next_5year_avg_dividend_growth,
@@ -232,11 +272,23 @@ SELECT
     pr.was_rising_10d,
     pr.was_rising_20d,
     pr.pct_from_20d_high,
-    pr.pct_from_20d_low
+    pr.pct_from_20d_low,
+    -- Holdings features
+    h.insider_net_shares,
+    h.insider_net_amount,
+    h.insider_buy_count,
+    h.insider_sell_count,
+    h.insider_transaction_count,
+    h.insider_buy_ratio,
+    h.buyback_total_shares,
+    h.buyback_total_amount,
+    h.buyback_count,
+    h.buyback_shares_pct
 FROM ml_features f
 LEFT JOIN ml_targets t ON f.instrument_id = t.instrument_id AND f.year = t.year
 LEFT JOIN ml_pre_report_features pr ON f.instrument_id = pr.instrument_id
     AND f.year = pr.report_year AND f.period = pr.report_period
+LEFT JOIN ml_holdings_features h ON f.instrument_id = h.instrument_id AND f.year = h.year
 WHERE f.period = 5  -- Only use full-year data for training
 ORDER BY f.instrument_id, f.year;
 

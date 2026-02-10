@@ -480,6 +480,9 @@ class MLTransformer:
             next_year_return = r.next_year_return,
             next_3year_return = r.next_3year_return,
             next_5year_return = r.next_5year_return,
+            next_year_excess_return = CASE WHEN r.next_year_return IS NOT NULL AND m.median_return IS NOT NULL
+                THEN r.next_year_return - m.median_return ELSE NULL END,
+            market_median_return = m.median_return,
             next_year_outperformed = (r.next_year_return > m.median_return),
             calculated_date = NOW()
         FROM returns r
@@ -532,11 +535,15 @@ class MLTransformer:
         INSERT INTO ml_targets (
             instrument_id, year,
             next_year_return, next_3year_return, next_5year_return,
+            next_year_excess_return, market_median_return,
             next_year_outperformed, calculated_date
         )
         SELECT
             r.instrument_id, r.year,
             r.next_year_return, r.next_3year_return, r.next_5year_return,
+            CASE WHEN r.next_year_return IS NOT NULL AND m.median_return IS NOT NULL
+                THEN r.next_year_return - m.median_return ELSE NULL END,
+            m.median_return,
             (r.next_year_return > m.median_return),
             NOW()
         FROM returns r
@@ -790,6 +797,187 @@ class MLTransformer:
         self.conn.commit()
         print(f"✓ Calculated pre-report features for {rows} reports")
 
+    def transform_holdings_data(self, instrument_id: int = None):
+        """
+        Transform insider trading and buyback data from raw JSONB into ml_holdings_features.
+
+        Insider data: per-instrument list of transactions with shares (+buy/-sell), amount, transactionDate
+        Buyback data: per-instrument list of events with change (shares), price, date
+
+        Note: Shorts data is snapshot-only (no time series) and is excluded to prevent data leakage.
+        """
+        print(f"Transforming holdings data{f' for instrument {instrument_id}' if instrument_id else ''}...")
+
+        # Clear existing data
+        if instrument_id:
+            self.cursor.execute("DELETE FROM ml_holdings_features WHERE instrument_id = %s", (instrument_id,))
+        else:
+            self.cursor.execute("TRUNCATE ml_holdings_features")
+
+        # Transform insider transactions: aggregate by (instrument_id, year)
+        insider_query = """
+        WITH insider_raw AS (
+            SELECT
+                (inst->>'insId')::integer as instrument_id,
+                (tx->>'transactionDate')::date as tx_date,
+                EXTRACT(YEAR FROM (tx->>'transactionDate')::date)::integer as tx_year,
+                (tx->>'shares')::integer as shares,
+                (tx->>'amount')::numeric as amount
+            FROM api_raw_data,
+                jsonb_array_elements(raw_data->'list') as inst,
+                jsonb_array_elements(inst->'values') as tx
+            WHERE endpoint_name = 'holdings_insider'
+              AND success = true
+              AND (tx->>'transactionDate') IS NOT NULL
+        ),
+        insider_yearly AS (
+            SELECT
+                instrument_id,
+                tx_year as year,
+                SUM(shares) as insider_net_shares,
+                SUM(amount) as insider_net_amount,
+                COUNT(CASE WHEN shares > 0 THEN 1 END) as insider_buy_count,
+                COUNT(CASE WHEN shares < 0 THEN 1 END) as insider_sell_count,
+                COUNT(*) as insider_transaction_count,
+                CASE WHEN COUNT(*) > 0
+                    THEN COUNT(CASE WHEN shares > 0 THEN 1 END)::numeric / COUNT(*)
+                    ELSE NULL
+                END as insider_buy_ratio
+            FROM insider_raw
+            GROUP BY instrument_id, tx_year
+        )
+        INSERT INTO ml_holdings_features (
+            instrument_id, year,
+            insider_net_shares, insider_net_amount,
+            insider_buy_count, insider_sell_count, insider_transaction_count, insider_buy_ratio
+        )
+        SELECT
+            instrument_id, year,
+            insider_net_shares, insider_net_amount,
+            insider_buy_count, insider_sell_count, insider_transaction_count, insider_buy_ratio
+        FROM insider_yearly
+        ON CONFLICT (instrument_id, year) DO UPDATE SET
+            insider_net_shares = EXCLUDED.insider_net_shares,
+            insider_net_amount = EXCLUDED.insider_net_amount,
+            insider_buy_count = EXCLUDED.insider_buy_count,
+            insider_sell_count = EXCLUDED.insider_sell_count,
+            insider_transaction_count = EXCLUDED.insider_transaction_count,
+            insider_buy_ratio = EXCLUDED.insider_buy_ratio
+        """
+
+        self.cursor.execute(insider_query)
+        insider_rows = self.cursor.rowcount
+        print(f"  ✓ Insider features: {insider_rows} (instrument, year) rows")
+
+        # Transform buyback data: aggregate by (instrument_id, year)
+        buyback_query = """
+        WITH buyback_raw AS (
+            SELECT
+                (inst->>'insId')::integer as instrument_id,
+                (ev->>'date')::date as ev_date,
+                EXTRACT(YEAR FROM (ev->>'date')::date)::integer as ev_year,
+                (ev->>'change')::bigint as change_shares,
+                (ev->>'price')::numeric as price,
+                (ev->>'sharesProc')::numeric as shares_pct
+            FROM api_raw_data,
+                jsonb_array_elements(raw_data->'list') as inst,
+                jsonb_array_elements(inst->'values') as ev
+            WHERE endpoint_name = 'holdings_buyback'
+              AND success = true
+              AND (ev->>'date') IS NOT NULL
+        ),
+        buyback_yearly AS (
+            SELECT
+                instrument_id,
+                ev_year as year,
+                SUM(ABS(change_shares)) as buyback_total_shares,
+                SUM(ABS(change_shares) * price) as buyback_total_amount,
+                COUNT(*) as buyback_count,
+                MAX(shares_pct) as buyback_shares_pct
+            FROM buyback_raw
+            WHERE change_shares > 0  -- only actual buybacks, not program cancellations
+            GROUP BY instrument_id, ev_year
+        )
+        UPDATE ml_holdings_features h
+        SET
+            buyback_total_shares = b.buyback_total_shares,
+            buyback_total_amount = b.buyback_total_amount,
+            buyback_count = b.buyback_count,
+            buyback_shares_pct = b.buyback_shares_pct
+        FROM buyback_yearly b
+        WHERE h.instrument_id = b.instrument_id AND h.year = b.year
+        """
+
+        self.cursor.execute(buyback_query)
+        buyback_updated = self.cursor.rowcount
+
+        # Also insert buyback data for instruments/years not yet in the table
+        buyback_insert = """
+        WITH buyback_raw AS (
+            SELECT
+                (inst->>'insId')::integer as instrument_id,
+                (ev->>'date')::date as ev_date,
+                EXTRACT(YEAR FROM (ev->>'date')::date)::integer as ev_year,
+                (ev->>'change')::bigint as change_shares,
+                (ev->>'price')::numeric as price,
+                (ev->>'sharesProc')::numeric as shares_pct
+            FROM api_raw_data,
+                jsonb_array_elements(raw_data->'list') as inst,
+                jsonb_array_elements(inst->'values') as ev
+            WHERE endpoint_name = 'holdings_buyback'
+              AND success = true
+              AND (ev->>'date') IS NOT NULL
+        ),
+        buyback_yearly AS (
+            SELECT
+                instrument_id,
+                ev_year as year,
+                SUM(ABS(change_shares)) as buyback_total_shares,
+                SUM(ABS(change_shares) * price) as buyback_total_amount,
+                COUNT(*) as buyback_count,
+                MAX(shares_pct) as buyback_shares_pct
+            FROM buyback_raw
+            WHERE change_shares > 0
+            GROUP BY instrument_id, ev_year
+        )
+        INSERT INTO ml_holdings_features (
+            instrument_id, year,
+            buyback_total_shares, buyback_total_amount, buyback_count, buyback_shares_pct
+        )
+        SELECT
+            instrument_id, year,
+            buyback_total_shares, buyback_total_amount, buyback_count, buyback_shares_pct
+        FROM buyback_yearly b
+        WHERE NOT EXISTS (
+            SELECT 1 FROM ml_holdings_features h
+            WHERE h.instrument_id = b.instrument_id AND h.year = b.year
+        )
+        """
+
+        self.cursor.execute(buyback_insert)
+        buyback_inserted = self.cursor.rowcount
+
+        self.conn.commit()
+        print(f"  ✓ Buyback features: {buyback_updated} updated, {buyback_inserted} new rows")
+
+        # Summary
+        self.cursor.execute("SELECT COUNT(*) FROM ml_holdings_features")
+        total = self.cursor.fetchone()[0]
+        print(f"✓ Holdings features total: {total} (instrument, year) rows")
+
+    def run_migrations(self):
+        """Run SQL migration to ensure schema is up to date."""
+        migration_path = os.path.join(os.path.dirname(__file__), 'migration_gap_fix.sql')
+        if not os.path.exists(migration_path):
+            print("⚠ Migration file not found, skipping schema update")
+            return
+        print("Running schema migrations...")
+        with open(migration_path, 'r') as f:
+            sql = f.read()
+        self.cursor.execute(sql)
+        self.conn.commit()
+        print("✓ Schema migrations applied")
+
     def run(self, instrument_id: int = None):
         """Run full transformation pipeline."""
         start_time = datetime.now()
@@ -799,6 +987,7 @@ class MLTransformer:
 
         try:
             self.connect()
+            self.run_migrations()
 
             # Transform in order
             self.transform_kpi_data(instrument_id)
@@ -806,6 +995,7 @@ class MLTransformer:
             self.transform_stock_prices(instrument_id)
             self.calculate_return_targets(instrument_id)
             self.calculate_pre_report_features(instrument_id)
+            self.transform_holdings_data(instrument_id)
 
             duration = (datetime.now() - start_time).total_seconds()
             print(f"\n{'='*60}")
@@ -828,12 +1018,13 @@ class MLTransformer:
                     COUNT(*) as total,
                     COUNT(next_year_dividend_growth) as has_dividend,
                     COUNT(next_year_return) as has_return,
+                    COUNT(next_year_excess_return) as has_excess_return,
                     COUNT(next_year_outperformed) as has_outperformed
                 FROM ml_targets
             """)
             t = self.cursor.fetchone()
             print(f"ML Targets: {t[0]} total rows, {t[1]} with dividend targets, "
-                  f"{t[2]} with return targets, {t[3]} with outperformance")
+                  f"{t[2]} with return targets, {t[3]} with excess return, {t[4]} with outperformance")
 
             self.cursor.execute("SELECT COUNT(*) FROM ml_stock_prices")
             price_count = self.cursor.fetchone()[0]
@@ -847,6 +1038,15 @@ class MLTransformer:
             if prereport_stats[0] > 0:
                 rising_pct = (prereport_stats[1] / prereport_stats[0]) * 100
                 print(f"Pre-Report Features: {prereport_stats[0]} reports, {rising_pct:.1f}% had rising prices before report")
+
+            self.cursor.execute("""
+                SELECT COUNT(*),
+                       COUNT(insider_net_shares) as has_insider,
+                       COUNT(buyback_count) as has_buyback
+                FROM ml_holdings_features
+            """)
+            h = self.cursor.fetchone()
+            print(f"Holdings Features: {h[0]} total rows, {h[1]} with insider data, {h[2]} with buyback data")
 
         except Exception as e:
             print(f"✗ Error: {e}")

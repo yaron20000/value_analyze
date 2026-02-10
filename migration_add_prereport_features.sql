@@ -58,6 +58,8 @@ SELECT
     t.next_year_return,
     t.next_3year_return,
     t.next_5year_return,
+    t.next_year_excess_return,
+    t.market_median_return,
     t.next_year_dividend_growth,
     t.next_3year_avg_dividend_growth,
     t.next_5year_avg_dividend_growth,
@@ -76,11 +78,23 @@ SELECT
     pr.was_rising_10d,
     pr.was_rising_20d,
     pr.pct_from_20d_high,
-    pr.pct_from_20d_low
+    pr.pct_from_20d_low,
+    -- Holdings features
+    h.insider_net_shares,
+    h.insider_net_amount,
+    h.insider_buy_count,
+    h.insider_sell_count,
+    h.insider_transaction_count,
+    h.insider_buy_ratio,
+    h.buyback_total_shares,
+    h.buyback_total_amount,
+    h.buyback_count,
+    h.buyback_shares_pct
 FROM ml_features f
 LEFT JOIN ml_targets t ON f.instrument_id = t.instrument_id AND f.year = t.year
 LEFT JOIN ml_pre_report_features pr ON f.instrument_id = pr.instrument_id
     AND f.year = pr.report_year AND f.period = pr.report_period
+LEFT JOIN ml_holdings_features h ON f.instrument_id = h.instrument_id AND f.year = h.year
 WHERE f.period = 5  -- Only use full-year data for training
 ORDER BY f.instrument_id, f.year;
 
