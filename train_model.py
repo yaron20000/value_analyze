@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Walk-Forward Excess Return Model with Portfolio Backtest
-=========================================================
-Trains a regression model to predict next-year excess return (stock return - market median)
-using expanding-window walk-forward validation.
+Walk-Forward Outperformance Classifier with Portfolio Backtest
+===============================================================
+Trains a classification model to predict whether a stock will outperform
+the market median next year. Uses predict_proba to produce a 0-1 score
+for ranking stocks.
 
 Each year:
 1. Train on all prior years
-2. Predict excess return for all stocks in the test year
-3. Rank stocks and pick top 10 / top decile
+2. Predict outperformance probability for all stocks in the test year
+3. Rank stocks by probability and pick top 10 / top decile
 4. Measure actual portfolio performance vs benchmark
 
 Outputs:
@@ -28,9 +29,9 @@ import argparse
 import os
 import sys
 from datetime import datetime
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -39,7 +40,7 @@ load_dotenv()
 
 
 class WalkForwardTrainer:
-    """Walk-forward expanding-window trainer for excess return prediction."""
+    """Walk-forward expanding-window classifier for outperformance prediction."""
 
     def __init__(self, db_config: dict, output_dir: str = 'results',
                  min_train_years: int = 3, top_n: int = 10):
@@ -49,7 +50,7 @@ class WalkForwardTrainer:
         self.min_train_years = min_train_years
         self.top_n = top_n
 
-        # Feature columns (69 original + 8 holdings = 77)
+        # Feature columns — ratios only, no absolute/per-share scale-dependent features
         self.feature_cols = [
             # Valuation
             'dividend_yield', 'pe_ratio', 'ps_ratio', 'pb_ratio',
@@ -64,30 +65,28 @@ class WalkForwardTrainer:
             # Growth
             'revenue_growth', 'earnings_growth',
             'ebit_growth', 'book_value_growth', 'assets_growth',
-            # Per Share
-            'revenue_per_share', 'eps', 'dividend_per_share',
-            'book_value_per_share', 'fcf_per_share', 'ocf_per_share',
-            # Cash Flow
-            'fcf_margin', 'earnings_fcf', 'ocf', 'capex',
+            # Cash Flow (ratio)
+            'fcf_margin', 'earnings_fcf',
             # Dividend
             'dividend_payout',
-            # Absolute
-            'earnings', 'revenue', 'ebitda', 'total_assets', 'total_equity',
-            'net_debt', 'num_shares', 'enterprise_value', 'market_cap', 'fcf',
             # Pre-report price features
             'price_change_5d', 'price_change_10d', 'price_change_20d', 'price_change_30d',
             'volume_ratio_5d_20d',
             'volatility_5d', 'volatility_20d',
             'was_rising_5d', 'was_rising_10d', 'was_rising_20d',
             'pct_from_20d_high', 'pct_from_20d_low',
-            # Holdings features
-            'insider_net_shares', 'insider_net_amount',
+            # Holdings (count-based — scale-independent)
             'insider_buy_count', 'insider_sell_count',
             'insider_transaction_count', 'insider_buy_ratio',
-            'buyback_total_shares', 'buyback_count',
+            'buyback_count',
+            # Normalized by market_cap (created in _prepare_features)
+            'total_assets_to_mcap', 'net_debt_to_mcap', 'ocf_to_mcap', 'capex_to_mcap',
+            'insider_amount_to_mcap',
+            # Normalized by num_shares (created in _prepare_features)
+            'insider_shares_to_total', 'buyback_shares_to_total',
         ]
 
-        self.target_col = 'next_year_excess_return'
+        self.target_col = 'next_year_excess_return'  # used to derive binary target
 
     def connect(self):
         self.conn = psycopg2.connect(
@@ -118,10 +117,40 @@ class WalkForwardTrainer:
         print(f"  Columns: {list(df.columns)}")
         return df
 
+    def _create_normalized_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create market-cap and share-count normalized features for absolute metrics
+        that don't already have ratio equivalents."""
+        df = df.copy()
+
+        # Normalize by market_cap (only features without existing ratio equivalents)
+        if 'market_cap' in df.columns:
+            mcap = df['market_cap'].replace(0, np.nan)
+            for raw_col, new_col in [
+                ('total_assets', 'total_assets_to_mcap'),
+                ('net_debt', 'net_debt_to_mcap'),
+                ('ocf', 'ocf_to_mcap'),
+                ('capex', 'capex_to_mcap'),
+                ('insider_net_amount', 'insider_amount_to_mcap'),
+            ]:
+                if raw_col in df.columns:
+                    df[new_col] = df[raw_col] / mcap
+
+        # Normalize by num_shares
+        if 'num_shares' in df.columns:
+            shares = df['num_shares'].replace(0, np.nan)
+            for raw_col, new_col in [
+                ('insider_net_shares', 'insider_shares_to_total'),
+                ('buyback_total_shares', 'buyback_shares_to_total'),
+            ]:
+                if raw_col in df.columns:
+                    df[new_col] = df[raw_col] / shares
+
+        return df
+
     def _prepare_fold(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
         """
         Prepare features for one walk-forward fold.
-        Imputation and scaling fit on train only, applied to both.
+        Creates normalized features, then imputes and scales (fit on train only).
 
         Returns: X_train, X_test, y_train, y_test, scaler, available_cols, train_medians
         """
@@ -129,8 +158,10 @@ class WalkForwardTrainer:
 
         X_train = train_df[available_cols].copy()
         X_test = test_df[available_cols].copy()
-        y_train = train_df[self.target_col].copy()
-        y_test = test_df[self.target_col].copy()
+
+        # Binary target: 1 if stock outperformed market median, 0 otherwise
+        y_train = (train_df[self.target_col] > 0).astype(int)
+        y_test = (test_df[self.target_col] > 0).astype(int)
 
         # Impute with training medians only
         train_medians = X_train.median()
@@ -180,36 +211,43 @@ class WalkForwardTrainer:
                 print(f"  Skipping: only {len(test_df)} stocks in test year")
                 continue
 
+            # Create normalized features on the dataframes before anything else
+            train_df = self._create_normalized_features(train_df)
+            test_df = self._create_normalized_features(test_df)
+
             print(f"  Train: {len(train_df)} rows, Test: {len(test_df)} stocks")
 
             # Prepare features
             X_train, X_test, y_train, y_test, _scaler, available_cols, train_medians = \
                 self._prepare_fold(train_df, test_df)
 
-            # Train model
-            model = RandomForestRegressor(
+            # Train classifier
+            model = RandomForestClassifier(
                 n_estimators=200,
-                max_depth=12,
+                max_depth=8,
                 min_samples_split=10,
-                min_samples_leaf=5,
+                min_samples_leaf=10,
                 random_state=42,
                 n_jobs=-1
             )
             model.fit(X_train, y_train)
 
-            # Predict
-            test_df = test_df.copy()
-            test_df['predicted_excess_return'] = model.predict(X_test)
+            # Predict probability of outperformance (0-1 score)
+            proba = model.predict_proba(X_test)[:, 1]  # probability of class 1 (outperform)
+            test_df['score'] = proba
+            predictions = model.predict(X_test)
 
-            # Evaluate
-            rmse = np.sqrt(mean_squared_error(y_test, test_df['predicted_excess_return']))
-            mae = mean_absolute_error(y_test, test_df['predicted_excess_return'])
-            r2 = r2_score(y_test, test_df['predicted_excess_return'])
+            # Evaluate classification quality
+            accuracy = accuracy_score(y_test, predictions)
+            auc = roc_auc_score(y_test, proba) if len(y_test.unique()) > 1 else 0.0
+            precision = precision_score(y_test, predictions, zero_division=0)
+            recall = recall_score(y_test, predictions, zero_division=0)
+            f1 = f1_score(y_test, predictions, zero_division=0)
 
-            print(f"  RMSE: {rmse:.2f}%, MAE: {mae:.2f}%, R2: {r2:.3f}")
+            print(f"  Accuracy: {accuracy:.1%}, AUC: {auc:.3f}, Precision: {precision:.1%}, Recall: {recall:.1%}, F1: {f1:.3f}")
 
-            # Rank stocks by predicted excess return
-            ranked = test_df.sort_values('predicted_excess_return', ascending=False).copy()
+            # Rank stocks by outperformance probability
+            ranked = test_df.sort_values('score', ascending=False).copy()
             ranked['rank'] = range(1, len(ranked) + 1)
 
             # Pick top N and top decile
@@ -244,9 +282,11 @@ class WalkForwardTrainer:
                 'train_years': f"{train_years[0]}-{train_years[-1]}",
                 'n_train': len(train_df),
                 'n_test': len(test_df),
-                'rmse': rmse,
-                'mae': mae,
-                'r2': r2,
+                'accuracy': accuracy,
+                'auc': auc,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
                 'benchmark_return': benchmark_return,
                 'top_n_return': top_n_actual_return,
                 'top_n_excess': top_n_excess,
@@ -296,8 +336,8 @@ class WalkForwardTrainer:
             # Test data with predictions
             test_export_cols = [c for c in id_cols + available_cols + target_cols if c in test_df.columns]
             test_export = test_df[test_export_cols].copy()
-            if 'predicted_excess_return' in test_df.columns:
-                test_export['predicted_excess_return'] = test_df['predicted_excess_return'].values
+            if 'score' in test_df.columns:
+                test_export['score'] = test_df['score'].values
             test_export.to_excel(writer, sheet_name='test_data', index=False)
 
             # Feature statistics (train set)
@@ -308,7 +348,7 @@ class WalkForwardTrainer:
 
             # Top N picks
             pick_cols = [c for c in ['rank', 'instrument_id', 'company_name', 'sector',
-                                      'predicted_excess_return', self.target_col,
+                                      'score', self.target_col,
                                       'next_year_return', 'market_median_return'] if c in ranked.columns]
             ranked.head(self.top_n)[pick_cols].to_excel(writer, sheet_name='top_n_picks', index=False)
 
@@ -332,9 +372,11 @@ class WalkForwardTrainer:
                 'train_period': result['train_years'],
                 'train_samples': result['n_train'],
                 'test_samples': result['n_test'],
-                'rmse': round(result['rmse'], 2),
-                'mae': round(result['mae'], 2),
-                'r2': round(result['r2'], 3),
+                'accuracy': round(result['accuracy'], 3),
+                'auc': round(result['auc'], 3),
+                'precision': round(result['precision'], 3),
+                'recall': round(result['recall'], 3),
+                'f1': round(result['f1'], 3),
             }])
             perf.to_excel(writer, sheet_name='model_performance', index=False)
 
@@ -345,7 +387,7 @@ class WalkForwardTrainer:
             # Top N portfolio
             top_n = result['top_n_picks'].copy()
             display_cols = [c for c in ['rank', 'instrument_id', 'company_name', 'sector',
-                                         'predicted_excess_return', self.target_col,
+                                         'score', self.target_col,
                                          'next_year_return', 'market_median_return']
                            if c in top_n.columns]
             top_n_display = top_n[display_cols].copy()
@@ -356,7 +398,7 @@ class WalkForwardTrainer:
                 'instrument_id': '',
                 'company_name': f'PORTFOLIO AVG (top {self.top_n})',
                 'sector': '',
-                'predicted_excess_return': top_n['predicted_excess_return'].mean() if 'predicted_excess_return' in top_n.columns else np.nan,
+                'score': top_n['score'].mean() if 'score' in top_n.columns else np.nan,
                 self.target_col: result['top_n_excess'],
                 'next_year_return': result['top_n_return'],
                 'market_median_return': result['benchmark_return'],
@@ -372,7 +414,7 @@ class WalkForwardTrainer:
                 'instrument_id': '',
                 'company_name': f'PORTFOLIO AVG (top decile, {result["decile_size"]})',
                 'sector': '',
-                'predicted_excess_return': top_dec['predicted_excess_return'].mean() if 'predicted_excess_return' in top_dec.columns else np.nan,
+                'score': top_dec['score'].mean() if 'score' in top_dec.columns else np.nan,
                 self.target_col: result['decile_excess'],
                 'next_year_return': result['decile_return'],
                 'market_median_return': result['benchmark_return'],
@@ -398,9 +440,11 @@ class WalkForwardTrainer:
                 'train_period': r['train_years'],
                 'n_train': r['n_train'],
                 'n_test': r['n_test'],
-                'rmse': round(r['rmse'], 2),
-                'mae': round(r['mae'], 2),
-                'r2': round(r['r2'], 3),
+                'accuracy': round(r['accuracy'], 3),
+                'auc': round(r['auc'], 3),
+                'precision': round(r['precision'], 3),
+                'recall': round(r['recall'], 3),
+                'f1': round(r['f1'], 3),
                 'benchmark_return': round(r['benchmark_return'], 2),
                 f'top_{self.top_n}_return': round(r['top_n_return'], 2),
                 f'top_{self.top_n}_excess': round(r['top_n_excess'], 2),
@@ -453,14 +497,20 @@ class WalkForwardTrainer:
 
             # Average metrics
             avg_metrics = pd.DataFrame([{
-                'metric': 'Avg RMSE',
-                'value': round(yearly['rmse'].mean(), 2),
+                'metric': 'Avg Accuracy',
+                'value': round(yearly['accuracy'].mean(), 3),
             }, {
-                'metric': 'Avg MAE',
-                'value': round(yearly['mae'].mean(), 2),
+                'metric': 'Avg AUC',
+                'value': round(yearly['auc'].mean(), 3),
             }, {
-                'metric': 'Avg R2',
-                'value': round(yearly['r2'].mean(), 3),
+                'metric': 'Avg Precision',
+                'value': round(yearly['precision'].mean(), 3),
+            }, {
+                'metric': 'Avg Recall',
+                'value': round(yearly['recall'].mean(), 3),
+            }, {
+                'metric': 'Avg F1',
+                'value': round(yearly['f1'].mean(), 3),
             }, {
                 'metric': f'Avg Top {self.top_n} Return',
                 'value': round(yearly[f'top_{self.top_n}_return'].mean(), 2),
@@ -504,15 +554,21 @@ class WalkForwardTrainer:
         print(f"Folds: {len(all_results)}")
         print(f"Years: {all_results[0]['test_year']} - {all_results[-1]['test_year']}")
 
-        avg_rmse = np.mean([r['rmse'] for r in all_results])
-        avg_r2 = np.mean([r['r2'] for r in all_results])
+        avg_accuracy = np.mean([r['accuracy'] for r in all_results])
+        avg_auc = np.mean([r['auc'] for r in all_results])
+        avg_precision = np.mean([r['precision'] for r in all_results])
+        avg_recall = np.mean([r['recall'] for r in all_results])
+        avg_f1 = np.mean([r['f1'] for r in all_results])
         avg_benchmark = np.mean([r['benchmark_return'] for r in all_results])
         avg_top_n = np.mean([r['top_n_return'] for r in all_results])
         avg_decile = np.mean([r['decile_return'] for r in all_results])
 
         print(f"\nModel Quality:")
-        print(f"  Avg RMSE:  {avg_rmse:.2f}%")
-        print(f"  Avg R2:    {avg_r2:.3f}")
+        print(f"  Avg Accuracy:  {avg_accuracy:.1%}")
+        print(f"  Avg AUC:       {avg_auc:.3f}")
+        print(f"  Avg Precision:  {avg_precision:.1%}")
+        print(f"  Avg Recall:     {avg_recall:.1%}")
+        print(f"  Avg F1:         {avg_f1:.3f}")
 
         print(f"\nPortfolio Performance (avg annual return):")
         print(f"  Benchmark (market median):  {avg_benchmark:+.2f}%")
