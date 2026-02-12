@@ -305,7 +305,8 @@ class WalkForwardTrainer:
                                    ranked, available_cols, train_medians)
 
             # Save year report
-            self._save_year_report(reports_dir, test_year, fold_result)
+            self._save_year_report(reports_dir, test_year, fold_result,
+                                   train_df, available_cols)
 
         if not all_results:
             print("\nNo walk-forward folds were run. Check your data.")
@@ -361,7 +362,8 @@ class WalkForwardTrainer:
 
         print(f"  Saved debug: {filepath}")
 
-    def _save_year_report(self, reports_dir: str, test_year: int, result: dict):
+    def _save_year_report(self, reports_dir: str, test_year: int, result: dict,
+                          train_df: pd.DataFrame = None, available_cols: list = None):
         """Save a per-year performance report."""
         filepath = os.path.join(reports_dir, f'year_{test_year}_report.xlsx')
 
@@ -426,6 +428,14 @@ class WalkForwardTrainer:
             ranked = result['ranked_df']
             all_cols = [c for c in display_cols if c in ranked.columns]
             ranked[all_cols].to_excel(writer, sheet_name='all_predictions', index=False)
+
+            # Training data per instrument
+            if train_df is not None and available_cols is not None:
+                id_cols = ['instrument_id', 'year', 'company_name', 'sector', 'market']
+                target_cols = [self.target_col, 'next_year_return', 'market_median_return']
+                export_cols = [c for c in id_cols + available_cols + target_cols if c in train_df.columns]
+                train_export = train_df[export_cols].sort_values(['instrument_id', 'year'])
+                train_export.to_excel(writer, sheet_name='training_data', index=False)
 
         print(f"  Saved report: {filepath}")
 
