@@ -237,6 +237,16 @@ class WalkForwardTrainer:
             test_df['score'] = proba
             predictions = model.predict(X_test)
 
+            # Build prediction input snapshot: the exact scaled values sent to the model
+            id_data = {}
+            for col in ['instrument_id', 'company_name', 'sector']:
+                if col in test_df.columns:
+                    id_data[col] = test_df[col].values
+            prediction_input_df = pd.DataFrame(id_data, index=test_df.index)
+            prediction_input_df[available_cols] = X_test
+            prediction_input_df['score'] = proba
+            prediction_input_df['predicted_outperform'] = predictions
+
             # Evaluate classification quality
             accuracy = accuracy_score(y_test, predictions)
             auc = roc_auc_score(y_test, proba) if len(y_test.unique()) > 1 else 0.0
@@ -302,7 +312,8 @@ class WalkForwardTrainer:
 
             # Save debug Excel for this year
             self._save_debug_excel(debug_dir, test_year, train_df, test_df,
-                                   ranked, available_cols, train_medians)
+                                   ranked, available_cols, train_medians,
+                                   prediction_input_df)
 
             # Save year report
             self._save_year_report(reports_dir, test_year, fold_result,
@@ -321,7 +332,8 @@ class WalkForwardTrainer:
     def _save_debug_excel(self, debug_dir: str, test_year: int,
                           train_df: pd.DataFrame, test_df: pd.DataFrame,
                           ranked: pd.DataFrame, available_cols: list,
-                          train_medians: pd.Series):
+                          train_medians: pd.Series,
+                          prediction_input_df: pd.DataFrame = None):
         """Save debug data for one fold to Excel."""
         filepath = os.path.join(debug_dir, f'year_{test_year}.xlsx')
 
@@ -359,6 +371,11 @@ class WalkForwardTrainer:
 
             # All predictions ranked
             ranked[pick_cols].to_excel(writer, sheet_name='all_ranked', index=False)
+
+            # Prediction input: exact scaled feature values sent to the model per stock
+            if prediction_input_df is not None:
+                prediction_input_df.sort_values('score', ascending=False).to_excel(
+                    writer, sheet_name='prediction_input', index=False)
 
         print(f"  Saved debug: {filepath}")
 
