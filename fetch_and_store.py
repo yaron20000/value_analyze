@@ -392,22 +392,20 @@ class BorsdataFetcher:
         data, error = self.make_request(endpoint, params)
 
         # Save to JSON file
-        filepath = self.save_to_json(name, data, error, kpi_name)
+        #filepath = self.save_to_json(name, data, error, kpi_name)
 
         # Save to database
         if self.db_enabled:
             self.save_to_db(name, endpoint, data, error, instrument_id, params, kpi_name)
 
         if data is not None:
-            self.stats['successful'] += 1
-            print(f"    ✓ Saved to {filepath}")
+            self.stats['successful'] += 1            
             if self.db_enabled:
                 print(f"    ✓ Saved to database")
             return True
         else:
             self.stats['failed'] += 1
-            print(f"    ✗ Error: {error}")
-            print(f"    ✓ Error logged to {filepath}")
+            print(f"    ✗ Error: {error}")            
             return False
 
     # Max instruments per batch KPI request to avoid API URL length limits
