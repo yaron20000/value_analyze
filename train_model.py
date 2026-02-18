@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-Walk-Forward Outperformance Classifier with Portfolio Backtest
-===============================================================
+Monthly Walk-Forward Outperformance Classifier with Portfolio Backtest
+======================================================================
 Trains a classification model to predict whether a stock will outperform
-the market median next year. Uses predict_proba to produce a 0-1 score
+the market median next month. Uses predict_proba to produce a 0-1 score
 for ranking stocks.
 
-Each year:
-1. Train on all prior years
-2. Predict outperformance probability for all stocks in the test year
-3. Rank stocks by probability and pick top 10 / top decile
-4. Measure actual portfolio performance vs benchmark
+Each month:
+1. Assemble features: latest available fundamentals (no look-ahead),
+   month-end price features, trailing 12-month holdings
+2. Train on all prior months (expanding window)
+3. Predict outperformance probability for all stocks
+4. Rank stocks by probability and pick top 20 / top decile
+5. Measure actual 1-month portfolio return
+
+Results are aggregated into yearly performance (compounded monthly returns).
 
 Outputs:
-- Excel debug files per year (train/test data sent to model)
-- Excel report per year (model performance, portfolio picks)
+- Excel debug files per month (model inputs + outputs only)
+- Excel report per year (compounded monthly performance, portfolio picks)
 - Summary report across all years (cumulative performance)
 
 Usage:
     python train_model.py --db-password yourpass
-    python train_model.py --db-password yourpass --min-train-years 5 --top-n 15
+    python train_model.py --db-password yourpass --min-train-months 36 --top-n 20
 """
 
 import pandas as pd
@@ -39,19 +43,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-class WalkForwardTrainer:
-    """Walk-forward expanding-window classifier for outperformance prediction."""
+class MonthlyWalkForwardTrainer:
+    """Monthly walk-forward expanding-window classifier for outperformance prediction."""
 
     def __init__(self, db_config: dict, output_dir: str = 'results',
-                 min_train_years: int = 3, top_n: int = 10):
+                 min_train_months: int = 36, top_n: int = 20):
         self.db_config = db_config
         self.conn = None
         self.output_dir = output_dir
-        self.min_train_years = min_train_years
+        self.min_train_months = min_train_months
         self.top_n = top_n
 
-        # Feature columns — ratios only, no absolute/per-share scale-dependent features
-        self.feature_cols = [
+        # Fundamental feature columns (from annual reports)
+        self.fundamental_cols = [
             # Valuation
             'dividend_yield', 'pe_ratio', 'ps_ratio', 'pb_ratio',
             'ev_ebit', 'ev_ebitda', 'ev_fcf', 'peg_ratio', 'ev_sales',
@@ -69,24 +73,34 @@ class WalkForwardTrainer:
             'fcf_margin', 'earnings_fcf',
             # Dividend
             'dividend_payout',
-            # Pre-report price features
+        ]
+
+        # Monthly price features (from ml_monthly_price_features)
+        self.price_cols = [
             'price_change_5d', 'price_change_10d', 'price_change_20d', 'price_change_30d',
             'volume_ratio_5d_20d',
             'volatility_5d', 'volatility_20d',
             'was_rising_5d', 'was_rising_10d', 'was_rising_20d',
             'pct_from_20d_high', 'pct_from_20d_low',
-            # Holdings (count-based — scale-independent)
+        ]
+
+        # Holdings features (from ml_holdings_features, yearly aggregation)
+        self.holdings_cols = [
             'insider_buy_count', 'insider_sell_count',
             'insider_transaction_count', 'insider_buy_ratio',
             'buyback_count',
-            # Normalized by market_cap (created in _prepare_features)
+        ]
+
+        # Normalized features (created in _create_normalized_features)
+        self.normalized_cols = [
             'total_assets_to_mcap', 'net_debt_to_mcap', 'ocf_to_mcap', 'capex_to_mcap',
             'insider_amount_to_mcap',
-            # Normalized by num_shares (created in _prepare_features)
             'insider_shares_to_total', 'buyback_shares_to_total',
         ]
 
-        self.target_col = 'next_year_excess_return'  # used to derive binary target
+        self.feature_cols = self.fundamental_cols + self.price_cols + self.holdings_cols + self.normalized_cols
+
+        self.target_col = 'next_month_excess_return'
 
     def connect(self):
         self.conn = psycopg2.connect(
@@ -102,27 +116,162 @@ class WalkForwardTrainer:
         if self.conn:
             self.conn.close()
 
-    def load_data(self) -> pd.DataFrame:
-        """Load all training data from the ml_training_data view."""
-        print("Loading data from ml_training_data...")
-        query = """
-        SELECT *
-        FROM ml_training_data
-        ORDER BY instrument_id, year
-        """
-        df = pd.read_sql(query, self.conn)
-        print(f"  Loaded {len(df)} rows, {len(df.columns)} columns")
-        print(f"  Instruments: {df['instrument_id'].nunique()}")
-        print(f"  Years: {df['year'].min()} - {df['year'].max()}")
-        print(f"  Columns: {list(df.columns)}")
+    def _load_monthly_targets(self) -> pd.DataFrame:
+        """Load monthly targets (returns)."""
+        print("Loading monthly targets...")
+        df = pd.read_sql("""
+            SELECT instrument_id, year, month, month_end_date, month_end_price,
+                   next_month_return, market_median_monthly_return, next_month_excess_return
+            FROM ml_monthly_targets
+            WHERE next_month_excess_return IS NOT NULL
+            ORDER BY year, month, instrument_id
+        """, self.conn)
+        print(f"  Monthly targets: {len(df)} rows, "
+              f"{df['instrument_id'].nunique()} instruments, "
+              f"{df['year'].min()}-{df['month'].iloc[0]:02d} to "
+              f"{df['year'].max()}-{df['month'].iloc[-1]:02d}")
         return df
 
+    def _load_fundamentals_with_dates(self) -> pd.DataFrame:
+        """Load fundamental features with report_date for look-ahead prevention."""
+        print("Loading fundamentals with report dates...")
+        df = pd.read_sql("""
+            SELECT
+                f.instrument_id, f.year as report_year,
+                f.company_name, f.sector, f.market,
+                -- Use report_date to know when fundamentals became public
+                -- Fall back to April of next year if report_date missing
+                COALESCE(pr.report_date, make_date(f.year + 1, 4, 1)) as report_date,
+                -- All fundamental features
+                f.dividend_yield, f.pe_ratio, f.ps_ratio, f.pb_ratio,
+                f.ev_ebit, f.ev_ebitda, f.ev_fcf, f.peg_ratio, f.ev_sales,
+                f.roe, f.roa, f.roc, f.roic,
+                f.ebitda_margin, f.operating_margin, f.gross_margin, f.net_margin,
+                f.fcf_margin_pct, f.ocf_margin,
+                f.debt_equity, f.equity_ratio, f.current_ratio,
+                f.net_debt_pct, f.net_debt_ebitda, f.cash_pct,
+                f.revenue_growth, f.earnings_growth,
+                f.ebit_growth, f.book_value_growth, f.assets_growth,
+                f.fcf_margin, f.earnings_fcf,
+                f.dividend_payout,
+                -- Absolute metrics for normalization
+                f.market_cap, f.num_shares, f.total_assets, f.net_debt,
+                f.ocf, f.capex
+            FROM ml_features f
+            LEFT JOIN ml_pre_report_features pr
+                ON f.instrument_id = pr.instrument_id
+                AND f.year = pr.report_year
+                AND f.period = pr.report_period
+            WHERE f.period = 5
+            ORDER BY f.instrument_id, f.year
+        """, self.conn)
+        df['report_date'] = pd.to_datetime(df['report_date'])
+        print(f"  Fundamentals: {len(df)} rows, {df['instrument_id'].nunique()} instruments")
+        return df
+
+    def _load_monthly_price_features(self) -> pd.DataFrame:
+        """Load monthly price features."""
+        print("Loading monthly price features...")
+        df = pd.read_sql("""
+            SELECT instrument_id, year, month,
+                   price_change_5d, price_change_10d, price_change_20d, price_change_30d,
+                   volume_ratio_5d_20d,
+                   volatility_5d, volatility_20d,
+                   was_rising_5d, was_rising_10d, was_rising_20d,
+                   pct_from_20d_high, pct_from_20d_low
+            FROM ml_monthly_price_features
+            ORDER BY instrument_id, year, month
+        """, self.conn)
+        print(f"  Monthly price features: {len(df)} rows")
+        return df
+
+    def _load_holdings(self) -> pd.DataFrame:
+        """Load holdings features (yearly, will be mapped to months)."""
+        print("Loading holdings features...")
+        df = pd.read_sql("""
+            SELECT instrument_id, year,
+                   insider_net_shares, insider_net_amount,
+                   insider_buy_count, insider_sell_count,
+                   insider_transaction_count, insider_buy_ratio,
+                   buyback_total_shares, buyback_total_amount,
+                   buyback_count, buyback_shares_pct
+            FROM ml_holdings_features
+            ORDER BY instrument_id, year
+        """, self.conn)
+        print(f"  Holdings: {len(df)} rows")
+        return df
+
+    def _assemble_monthly_features(self, targets_df: pd.DataFrame,
+                                    fundamentals_df: pd.DataFrame,
+                                    price_features_df: pd.DataFrame,
+                                    holdings_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Assemble the full feature matrix for all (stock, month) pairs.
+
+        For each (instrument, year, month):
+        - Fundamentals: latest annual report published BEFORE the 1st of that month
+        - Price features: as of that month-end
+        - Holdings: most recent completed year before that month
+        """
+        print("Assembling monthly feature matrix...")
+
+        # Create a date column for each monthly target row (1st of month)
+        df = targets_df.copy()
+        df['month_start'] = pd.to_datetime(
+            df['year'].astype(str) + '-' + df['month'].astype(str).str.zfill(2) + '-01'
+        )
+
+        # --- Join fundamentals: latest report published before month_start ---
+        # Sort fundamentals by report_date for merge_asof
+        fund_sorted = fundamentals_df.sort_values('report_date')
+        df_sorted = df.sort_values('month_start')
+
+        merged = pd.merge_asof(
+            df_sorted,
+            fund_sorted,
+            by='instrument_id',
+            left_on='month_start',
+            right_on='report_date',
+            direction='backward',
+            suffixes=('', '_fund')
+        )
+
+        # --- Join monthly price features ---
+        merged = merged.merge(
+            price_features_df,
+            on=['instrument_id', 'year', 'month'],
+            how='left',
+            suffixes=('', '_price')
+        )
+
+        # --- Join holdings: use the most recent year with data before the target month ---
+        # For month M in year Y: use holdings from year Y-1 (or Y if month >= July)
+        # Simple approach: use holdings year = target year - 1
+        holdings_mapped = holdings_df.copy()
+        holdings_mapped['holdings_for_year'] = holdings_mapped['year'] + 1
+        merged = merged.merge(
+            holdings_mapped.drop(columns=['year']),
+            left_on=['instrument_id', 'year'],
+            right_on=['instrument_id', 'holdings_for_year'],
+            how='left',
+            suffixes=('', '_hold')
+        )
+        if 'holdings_for_year' in merged.columns:
+            merged.drop(columns=['holdings_for_year'], inplace=True)
+
+        # Create normalized features
+        merged = self._create_normalized_features(merged)
+
+        print(f"  Assembled: {len(merged)} rows, {merged['instrument_id'].nunique()} instruments")
+        n_with_fundamentals = merged['report_date'].notna().sum()
+        print(f"  With fundamentals: {n_with_fundamentals} ({n_with_fundamentals/len(merged)*100:.1f}%)")
+
+        return merged
+
     def _create_normalized_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create market-cap and share-count normalized features for absolute metrics
-        that don't already have ratio equivalents."""
+        """Create market-cap and share-count normalized features."""
         df = df.copy()
 
-        # Normalize by market_cap (only features without existing ratio equivalents)
         if 'market_cap' in df.columns:
             mcap = df['market_cap'].replace(0, np.nan)
             for raw_col, new_col in [
@@ -135,7 +284,6 @@ class WalkForwardTrainer:
                 if raw_col in df.columns:
                     df[new_col] = df[raw_col] / mcap
 
-        # Normalize by num_shares
         if 'num_shares' in df.columns:
             shares = df['num_shares'].replace(0, np.nan)
             for raw_col, new_col in [
@@ -150,16 +298,16 @@ class WalkForwardTrainer:
     def _prepare_fold(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
         """
         Prepare features for one walk-forward fold.
-        Creates normalized features, then imputes and scales (fit on train only).
+        Imputes and scales (fit on train only).
 
-        Returns: X_train, X_test, y_train, y_test, scaler, available_cols, train_medians
+        Returns: X_train, X_test, y_train, y_test, available_cols, train_medians
         """
         available_cols = [c for c in self.feature_cols if c in train_df.columns]
 
         X_train = train_df[available_cols].copy()
         X_test = test_df[available_cols].copy()
 
-        # Binary target: 1 if stock outperformed market median, 0 otherwise
+        # Binary target: 1 if stock outperformed market median that month
         y_train = (train_df[self.target_col] > 0).astype(int)
         y_test = (test_df[self.target_col] > 0).astype(int)
 
@@ -173,20 +321,33 @@ class WalkForwardTrainer:
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
-        return X_train_scaled, X_test_scaled, y_train, y_test, scaler, available_cols, train_medians
+        return X_train_scaled, X_test_scaled, y_train, y_test, available_cols, train_medians
 
     def run_walk_forward(self):
-        """Run the full walk-forward expanding-window backtest."""
-        df = self.load_data()
+        """Run the full monthly walk-forward expanding-window backtest."""
 
-        # Filter to rows with valid target
-        df_valid = df[df[self.target_col].notna()].copy()
-        print(f"  Rows with valid {self.target_col}: {len(df_valid)}")
+        # Load all data
+        targets_df = self._load_monthly_targets()
+        fundamentals_df = self._load_fundamentals_with_dates()
+        price_features_df = self._load_monthly_price_features()
+        holdings_df = self._load_holdings()
 
-        years = sorted(df_valid['year'].unique())
-        print(f"  Available years: {years[0]} - {years[-1]} ({len(years)} years)")
-        print(f"  Min training years: {self.min_train_years}")
-        print(f"  Walk-forward folds: {len(years) - self.min_train_years}")
+        # Assemble full feature matrix
+        df = self._assemble_monthly_features(
+            targets_df, fundamentals_df, price_features_df, holdings_df
+        )
+
+        # Filter to rows with valid target and fundamentals
+        df_valid = df[df[self.target_col].notna() & df['report_date'].notna()].copy()
+        print(f"\nValid rows for training: {len(df_valid)}")
+
+        # Create (year, month) index for walk-forward
+        month_keys = df_valid[['year', 'month']].drop_duplicates().sort_values(['year', 'month'])
+        months_list = list(month_keys.itertuples(index=False, name=None))
+        print(f"Available months: {months_list[0][0]}-{months_list[0][1]:02d} to "
+              f"{months_list[-1][0]}-{months_list[-1][1]:02d} ({len(months_list)} months)")
+        print(f"Min training months: {self.min_train_months}")
+        print(f"Walk-forward folds: {len(months_list) - self.min_train_months}")
 
         # Create output directories
         debug_dir = os.path.join(self.output_dir, 'debug')
@@ -194,31 +355,32 @@ class WalkForwardTrainer:
         os.makedirs(debug_dir, exist_ok=True)
         os.makedirs(reports_dir, exist_ok=True)
 
-        all_results = []
+        all_monthly_results = []
 
-        for i in range(self.min_train_years, len(years)):
-            train_years = years[:i]
-            test_year = years[i]
+        for i in range(self.min_train_months, len(months_list)):
+            train_months = months_list[:i]
+            test_year, test_month = months_list[i]
 
-            print(f"\n{'='*70}")
-            print(f"FOLD: Train on {train_years[0]}-{train_years[-1]} ({len(train_years)} years) -> Test on {test_year}")
-            print(f"{'='*70}")
+            # Build train/test masks using vectorized year*100+month key
+            train_set = set(y * 100 + m for y, m in train_months)
+            ym_key = df_valid['year'] * 100 + df_valid['month']
+            train_mask = ym_key.isin(train_set)
+            test_mask = (df_valid['year'] == test_year) & (df_valid['month'] == test_month)
 
-            train_df = df_valid[df_valid['year'].isin(train_years)].copy()
-            test_df = df_valid[df_valid['year'] == test_year].copy()
+            train_df = df_valid[train_mask].copy()
+            test_df = df_valid[test_mask].copy()
 
             if len(test_df) < 5:
-                print(f"  Skipping: only {len(test_df)} stocks in test year")
                 continue
 
-            # Create normalized features on the dataframes before anything else
-            train_df = self._create_normalized_features(train_df)
-            test_df = self._create_normalized_features(test_df)
-
-            print(f"  Train: {len(train_df)} rows, Test: {len(test_df)} stocks")
+            first_train = train_months[0]
+            print(f"\n  {test_year}-{test_month:02d}: "
+                  f"Train {first_train[0]}-{first_train[1]:02d} to "
+                  f"{train_months[-1][0]}-{train_months[-1][1]:02d} "
+                  f"({len(train_df)} rows) -> Test {len(test_df)} stocks", end='')
 
             # Prepare features
-            X_train, X_test, y_train, y_test, _scaler, available_cols, train_medians = \
+            X_train, X_test, y_train, y_test, available_cols, _train_medians = \
                 self._prepare_fold(train_df, test_df)
 
             # Train classifier
@@ -232,51 +394,37 @@ class WalkForwardTrainer:
             )
             model.fit(X_train, y_train)
 
-            # Predict probability of outperformance (0-1 score)
-            proba = model.predict_proba(X_test)[:, 1]  # probability of class 1 (outperform)
+            # Predict
+            proba = model.predict_proba(X_test)[:, 1]
+            test_df = test_df.copy()
             test_df['score'] = proba
             predictions = model.predict(X_test)
 
-            # Build prediction input snapshot: the exact scaled values sent to the model
-            id_data = {}
-            for col in ['instrument_id', 'company_name', 'sector']:
-                if col in test_df.columns:
-                    id_data[col] = test_df[col].values
-            prediction_input_df = pd.DataFrame(id_data, index=test_df.index)
-            prediction_input_df[available_cols] = X_test
-            prediction_input_df['score'] = proba
-            prediction_input_df['predicted_outperform'] = predictions
-
-            # Evaluate classification quality
+            # Evaluate
             accuracy = accuracy_score(y_test, predictions)
             auc = roc_auc_score(y_test, proba) if len(y_test.unique()) > 1 else 0.0
             precision = precision_score(y_test, predictions, zero_division=0)
             recall = recall_score(y_test, predictions, zero_division=0)
             f1 = f1_score(y_test, predictions, zero_division=0)
 
-            print(f"  Accuracy: {accuracy:.1%}, AUC: {auc:.3f}, Precision: {precision:.1%}, Recall: {recall:.1%}, F1: {f1:.3f}")
+            print(f" | AUC={auc:.3f}", end='')
 
-            # Rank stocks by outperformance probability
+            # Rank and pick
             ranked = test_df.sort_values('score', ascending=False).copy()
             ranked['rank'] = range(1, len(ranked) + 1)
 
-            # Pick top N and top decile
             top_n_picks = ranked.head(self.top_n).copy()
             decile_size = max(1, len(ranked) // 10)
             top_decile_picks = ranked.head(decile_size).copy()
 
-            # Calculate portfolio returns
-            # Use actual next_year_return (not excess) for real portfolio performance
-            benchmark_return = test_df['market_median_return'].iloc[0] if 'market_median_return' in test_df.columns else 0
-
-            top_n_actual_return = top_n_picks['next_year_return'].mean() if 'next_year_return' in top_n_picks.columns else np.nan
+            # Portfolio returns (actual next-month returns)
+            benchmark_return = test_df['market_median_monthly_return'].iloc[0]
+            top_n_return = top_n_picks['next_month_return'].mean()
             top_n_excess = top_n_picks[self.target_col].mean()
-            decile_actual_return = top_decile_picks['next_year_return'].mean() if 'next_year_return' in top_decile_picks.columns else np.nan
+            decile_return = top_decile_picks['next_month_return'].mean()
             decile_excess = top_decile_picks[self.target_col].mean()
 
-            print(f"  Benchmark (market median): {benchmark_return:.2f}%")
-            print(f"  Top {self.top_n} portfolio: {top_n_actual_return:.2f}% return ({top_n_excess:+.2f}% excess)")
-            print(f"  Top decile ({decile_size}): {decile_actual_return:.2f}% return ({decile_excess:+.2f}% excess)")
+            print(f" | Top{self.top_n}={top_n_return:+.2f}% Bench={benchmark_return:+.2f}%")
 
             # Feature importance
             feature_importance = pd.DataFrame({
@@ -284,12 +432,10 @@ class WalkForwardTrainer:
                 'importance': model.feature_importances_
             }).sort_values('importance', ascending=False)
 
-            print(f"  Top 5 features: {', '.join(feature_importance.head(5)['feature'].tolist())}")
-
-            # Store results
-            fold_result = {
-                'test_year': test_year,
-                'train_years': f"{train_years[0]}-{train_years[-1]}",
+            # Store monthly result
+            monthly_result = {
+                'year': test_year,
+                'month': test_month,
                 'n_train': len(train_df),
                 'n_test': len(test_df),
                 'accuracy': accuracy,
@@ -298,223 +444,250 @@ class WalkForwardTrainer:
                 'recall': recall,
                 'f1': f1,
                 'benchmark_return': benchmark_return,
-                'top_n_return': top_n_actual_return,
+                'top_n_return': top_n_return,
                 'top_n_excess': top_n_excess,
-                'decile_return': decile_actual_return,
+                'decile_return': decile_return,
                 'decile_excess': decile_excess,
                 'decile_size': decile_size,
                 'feature_importance': feature_importance,
-                'ranked_df': ranked,
                 'top_n_picks': top_n_picks,
                 'top_decile_picks': top_decile_picks,
             }
-            all_results.append(fold_result)
+            all_monthly_results.append(monthly_result)
 
-            # Save debug Excel for this year
-            self._save_debug_excel(debug_dir, test_year, train_df, test_df,
-                                   ranked, available_cols, train_medians,
-                                   prediction_input_df)
+            # Save debug Excel (model inputs + outputs only)
+            self._save_debug_excel(
+                debug_dir, test_year, test_month, test_df,
+                X_test, available_cols, proba, predictions
+            )
 
-            # Save year report
-            self._save_year_report(reports_dir, test_year, fold_result,
-                                   train_df, available_cols)
-
-        if not all_results:
+        if not all_monthly_results:
             print("\nNo walk-forward folds were run. Check your data.")
             return
 
-        # Generate summary report
-        self._save_summary_report(reports_dir, all_results)
+        # Aggregate monthly results to yearly
+        yearly_results = self._aggregate_to_yearly(all_monthly_results)
 
-        # Print final summary
-        self._print_summary(all_results)
+        # Save reports
+        self._save_yearly_reports(reports_dir, yearly_results)
+        self._save_summary_report(reports_dir, yearly_results, all_monthly_results)
 
-    def _save_debug_excel(self, debug_dir: str, test_year: int,
-                          train_df: pd.DataFrame, test_df: pd.DataFrame,
-                          ranked: pd.DataFrame, available_cols: list,
-                          train_medians: pd.Series,
-                          prediction_input_df: pd.DataFrame = None):
-        """Save debug data for one fold to Excel."""
-        filepath = os.path.join(debug_dir, f'year_{test_year}.xlsx')
+        # Print summary
+        self._print_summary(yearly_results, all_monthly_results)
 
-        # Columns to include for readability
-        id_cols = ['instrument_id', 'year', 'company_name', 'sector', 'market']
-        target_cols = [self.target_col, 'next_year_return', 'market_median_return']
+    def _save_debug_excel(self, debug_dir: str, year: int, month: int,
+                          test_df: pd.DataFrame, X_test_scaled: np.ndarray,
+                          available_cols: list, proba: np.ndarray,
+                          predictions: np.ndarray):
+        """Save debug data: only model inputs (scaled features) and outputs."""
+        filepath = os.path.join(debug_dir, f'month_{year}_{month:02d}.xlsx')
 
-        with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-            # Train data (features + targets)
-            train_export_cols = [c for c in id_cols + available_cols + target_cols if c in train_df.columns]
-            train_df[train_export_cols].to_excel(writer, sheet_name='train_data', index=False)
+        # Build prediction input snapshot: exact scaled values + outputs
+        id_data = {}
+        for col in ['instrument_id', 'company_name', 'sector']:
+            if col in test_df.columns:
+                id_data[col] = test_df[col].values
 
-            # Test data with predictions
-            test_export_cols = [c for c in id_cols + available_cols + target_cols if c in test_df.columns]
-            test_export = test_df[test_export_cols].copy()
-            if 'score' in test_df.columns:
-                test_export['score'] = test_df['score'].values
-            test_export.to_excel(writer, sheet_name='test_data', index=False)
-
-            # Feature statistics (train set)
-            feature_stats = train_df[available_cols].describe().T
-            feature_stats['missing_pct'] = (train_df[available_cols].isna().sum() / len(train_df) * 100)
-            feature_stats['median_impute_value'] = train_medians[available_cols]
-            feature_stats.to_excel(writer, sheet_name='feature_stats')
-
-            # Top N picks
-            pick_cols = [c for c in ['rank', 'instrument_id', 'company_name', 'sector',
-                                      'score', self.target_col,
-                                      'next_year_return', 'market_median_return'] if c in ranked.columns]
-            ranked.head(self.top_n)[pick_cols].to_excel(writer, sheet_name='top_n_picks', index=False)
-
-            # Top decile picks
-            decile_size = max(1, len(ranked) // 10)
-            ranked.head(decile_size)[pick_cols].to_excel(writer, sheet_name='top_decile_picks', index=False)
-
-            # All predictions ranked
-            ranked[pick_cols].to_excel(writer, sheet_name='all_ranked', index=False)
-
-            # Prediction input: exact scaled feature values sent to the model per stock
-            if prediction_input_df is not None:
-                prediction_input_df.sort_values('score', ascending=False).to_excel(
-                    writer, sheet_name='prediction_input', index=False)
-
-        print(f"  Saved debug: {filepath}")
-
-    def _save_year_report(self, reports_dir: str, test_year: int, result: dict,
-                          train_df: pd.DataFrame = None, available_cols: list = None):
-        """Save a per-year performance report."""
-        filepath = os.path.join(reports_dir, f'year_{test_year}_report.xlsx')
+        debug_df = pd.DataFrame(id_data, index=test_df.index)
+        for j, col in enumerate(available_cols):
+            debug_df[col] = X_test_scaled[:, j]
+        debug_df['score'] = proba
+        debug_df['predicted_outperform'] = predictions
 
         with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-            # Model performance
-            perf = pd.DataFrame([{
-                'test_year': result['test_year'],
-                'train_period': result['train_years'],
-                'train_samples': result['n_train'],
-                'test_samples': result['n_test'],
-                'accuracy': round(result['accuracy'], 3),
-                'auc': round(result['auc'], 3),
-                'precision': round(result['precision'], 3),
-                'recall': round(result['recall'], 3),
-                'f1': round(result['f1'], 3),
-            }])
-            perf.to_excel(writer, sheet_name='model_performance', index=False)
+            debug_df.sort_values('score', ascending=False).to_excel(
+                writer, sheet_name='model_input_output', index=False
+            )
 
-            # Feature importances (top 20)
-            result['feature_importance'].head(20).to_excel(
-                writer, sheet_name='feature_importance', index=False)
+        print(f"    Debug: {filepath}")
 
-            # Top N portfolio
-            top_n = result['top_n_picks'].copy()
-            display_cols = [c for c in ['rank', 'instrument_id', 'company_name', 'sector',
-                                         'score', self.target_col,
-                                         'next_year_return', 'market_median_return']
-                           if c in top_n.columns]
-            top_n_display = top_n[display_cols].copy()
+    def _aggregate_to_yearly(self, monthly_results: list) -> list:
+        """Compound monthly returns into yearly results."""
+        yearly = {}
+        for mr in monthly_results:
+            y = mr['year']
+            if y not in yearly:
+                yearly[y] = {
+                    'year': y,
+                    'months': [],
+                    'benchmark_monthly': [],
+                    'top_n_monthly': [],
+                    'decile_monthly': [],
+                    'accuracies': [],
+                    'aucs': [],
+                    'precisions': [],
+                    'recalls': [],
+                    'f1s': [],
+                    'n_trains': [],
+                    'n_tests': [],
+                    'decile_sizes': [],
+                    'feature_importances': [],
+                    'all_top_n_picks': [],
+                    'all_decile_picks': [],
+                }
+            yearly[y]['months'].append(mr['month'])
+            yearly[y]['benchmark_monthly'].append(mr['benchmark_return'])
+            yearly[y]['top_n_monthly'].append(mr['top_n_return'])
+            yearly[y]['decile_monthly'].append(mr['decile_return'])
+            yearly[y]['accuracies'].append(mr['accuracy'])
+            yearly[y]['aucs'].append(mr['auc'])
+            yearly[y]['precisions'].append(mr['precision'])
+            yearly[y]['recalls'].append(mr['recall'])
+            yearly[y]['f1s'].append(mr['f1'])
+            yearly[y]['n_trains'].append(mr['n_train'])
+            yearly[y]['n_tests'].append(mr['n_test'])
+            yearly[y]['decile_sizes'].append(mr['decile_size'])
+            yearly[y]['feature_importances'].append(mr['feature_importance'])
+            yearly[y]['all_top_n_picks'].append(mr['top_n_picks'])
+            yearly[y]['all_decile_picks'].append(mr['top_decile_picks'])
 
-            # Add summary row
-            summary_row = pd.DataFrame([{
-                'rank': '',
-                'instrument_id': '',
-                'company_name': f'PORTFOLIO AVG (top {self.top_n})',
-                'sector': '',
-                'score': top_n['score'].mean() if 'score' in top_n.columns else np.nan,
-                self.target_col: result['top_n_excess'],
-                'next_year_return': result['top_n_return'],
-                'market_median_return': result['benchmark_return'],
-            }])
-            top_n_out = pd.concat([top_n_display, summary_row], ignore_index=True)
-            top_n_out.to_excel(writer, sheet_name='portfolio_top_n', index=False)
+        # Compound monthly returns for each year
+        results = []
+        for y in sorted(yearly.keys()):
+            yd = yearly[y]
+            # Compound: product of (1 + r/100) - 1, times 100
+            benchmark_compound = (np.prod([1 + r/100 for r in yd['benchmark_monthly']]) - 1) * 100
+            top_n_compound = (np.prod([1 + r/100 for r in yd['top_n_monthly']]) - 1) * 100
+            decile_compound = (np.prod([1 + r/100 for r in yd['decile_monthly']]) - 1) * 100
 
-            # Top decile portfolio
-            top_dec = result['top_decile_picks'].copy()
-            top_dec_display = top_dec[[c for c in display_cols if c in top_dec.columns]].copy()
-            dec_summary = pd.DataFrame([{
-                'rank': '',
-                'instrument_id': '',
-                'company_name': f'PORTFOLIO AVG (top decile, {result["decile_size"]})',
-                'sector': '',
-                'score': top_dec['score'].mean() if 'score' in top_dec.columns else np.nan,
-                self.target_col: result['decile_excess'],
-                'next_year_return': result['decile_return'],
-                'market_median_return': result['benchmark_return'],
-            }])
-            top_dec_out = pd.concat([top_dec_display, dec_summary], ignore_index=True)
-            top_dec_out.to_excel(writer, sheet_name='portfolio_decile', index=False)
+            # Average feature importance across months
+            all_fi = pd.concat(yd['feature_importances'])
+            avg_fi = all_fi.groupby('feature')['importance'].mean().reset_index()
+            avg_fi = avg_fi.sort_values('importance', ascending=False)
 
-            # All stocks ranked
-            ranked = result['ranked_df']
-            all_cols = [c for c in display_cols if c in ranked.columns]
-            ranked[all_cols].to_excel(writer, sheet_name='all_predictions', index=False)
+            results.append({
+                'year': y,
+                'n_months': len(yd['months']),
+                'months': yd['months'],
+                'n_train_avg': int(np.mean(yd['n_trains'])),
+                'n_test_avg': int(np.mean(yd['n_tests'])),
+                'accuracy': np.mean(yd['accuracies']),
+                'auc': np.mean(yd['aucs']),
+                'precision': np.mean(yd['precisions']),
+                'recall': np.mean(yd['recalls']),
+                'f1': np.mean(yd['f1s']),
+                'benchmark_return': benchmark_compound,
+                'top_n_return': top_n_compound,
+                'top_n_excess': top_n_compound - benchmark_compound,
+                'decile_return': decile_compound,
+                'decile_excess': decile_compound - benchmark_compound,
+                'decile_size_avg': int(np.mean(yd['decile_sizes'])),
+                'feature_importance': avg_fi,
+                'monthly_benchmark': yd['benchmark_monthly'],
+                'monthly_top_n': yd['top_n_monthly'],
+                'monthly_decile': yd['decile_monthly'],
+                'all_top_n_picks': yd['all_top_n_picks'],
+                'all_decile_picks': yd['all_decile_picks'],
+            })
 
-            # Training data per instrument
-            if train_df is not None and available_cols is not None:
-                id_cols = ['instrument_id', 'year', 'company_name', 'sector', 'market']
-                target_cols = [self.target_col, 'next_year_return', 'market_median_return']
-                export_cols = [c for c in id_cols + available_cols + target_cols if c in train_df.columns]
-                train_export = train_df[export_cols].sort_values(['instrument_id', 'year'])
-                train_export.to_excel(writer, sheet_name='training_data', index=False)
+        return results
 
-        print(f"  Saved report: {filepath}")
+    def _save_yearly_reports(self, reports_dir: str, yearly_results: list):
+        """Save per-year performance reports."""
+        for yr in yearly_results:
+            filepath = os.path.join(reports_dir, f'year_{yr["year"]}_report.xlsx')
 
-    def _save_summary_report(self, reports_dir: str, all_results: list):
+            with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                # Model performance
+                perf = pd.DataFrame([{
+                    'year': yr['year'],
+                    'months_tested': yr['n_months'],
+                    'avg_train_samples': yr['n_train_avg'],
+                    'avg_test_samples': yr['n_test_avg'],
+                    'avg_accuracy': round(yr['accuracy'], 3),
+                    'avg_auc': round(yr['auc'], 3),
+                    'avg_precision': round(yr['precision'], 3),
+                    'avg_recall': round(yr['recall'], 3),
+                    'avg_f1': round(yr['f1'], 3),
+                    'benchmark_return_compounded': round(yr['benchmark_return'], 2),
+                    f'top_{self.top_n}_return_compounded': round(yr['top_n_return'], 2),
+                    f'top_{self.top_n}_excess': round(yr['top_n_excess'], 2),
+                    'decile_return_compounded': round(yr['decile_return'], 2),
+                    'decile_excess': round(yr['decile_excess'], 2),
+                }])
+                perf.to_excel(writer, sheet_name='performance', index=False)
+
+                # Monthly breakdown
+                monthly_data = pd.DataFrame({
+                    'month': yr['months'],
+                    'benchmark_return': [round(r, 2) for r in yr['monthly_benchmark']],
+                    f'top_{self.top_n}_return': [round(r, 2) for r in yr['monthly_top_n']],
+                    'decile_return': [round(r, 2) for r in yr['monthly_decile']],
+                })
+                monthly_data.to_excel(writer, sheet_name='monthly_breakdown', index=False)
+
+                # Feature importance (avg across months)
+                yr['feature_importance'].head(20).to_excel(
+                    writer, sheet_name='feature_importance', index=False
+                )
+
+                # Top N picks — show which stocks were picked each month
+                pick_display_cols = ['instrument_id', 'company_name', 'sector',
+                                     'score', 'next_month_return', 'next_month_excess_return']
+                for m, picks_df in zip(yr['months'], yr['all_top_n_picks']):
+                    display_cols = [c for c in pick_display_cols if c in picks_df.columns]
+                    sheet_name = f'picks_month_{m:02d}'
+                    picks_df[display_cols].to_excel(writer, sheet_name=sheet_name, index=False)
+
+            print(f"  Saved report: {filepath}")
+
+    def _save_summary_report(self, reports_dir: str, yearly_results: list,
+                              monthly_results: list):
         """Save the cross-year summary report."""
         filepath = os.path.join(reports_dir, 'summary_report.xlsx')
 
         with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
             # Yearly overview
-            yearly = pd.DataFrame([{
-                'year': r['test_year'],
-                'train_period': r['train_years'],
-                'n_train': r['n_train'],
-                'n_test': r['n_test'],
-                'accuracy': round(r['accuracy'], 3),
-                'auc': round(r['auc'], 3),
-                'precision': round(r['precision'], 3),
-                'recall': round(r['recall'], 3),
-                'f1': round(r['f1'], 3),
+            yearly_df = pd.DataFrame([{
+                'year': r['year'],
+                'months': r['n_months'],
+                'avg_auc': round(r['auc'], 3),
+                'avg_accuracy': round(r['accuracy'], 3),
                 'benchmark_return': round(r['benchmark_return'], 2),
                 f'top_{self.top_n}_return': round(r['top_n_return'], 2),
                 f'top_{self.top_n}_excess': round(r['top_n_excess'], 2),
                 'decile_return': round(r['decile_return'], 2),
                 'decile_excess': round(r['decile_excess'], 2),
-                'decile_size': r['decile_size'],
-            } for r in all_results])
-            yearly.to_excel(writer, sheet_name='yearly_overview', index=False)
+                'decile_size_avg': r['decile_size_avg'],
+            } for r in yearly_results])
+            yearly_df.to_excel(writer, sheet_name='yearly_overview', index=False)
 
             # Cumulative performance (invest 100 at start)
-            cumulative = pd.DataFrame()
-            cumulative['year'] = yearly['year']
-            cumulative['benchmark_return_pct'] = yearly['benchmark_return']
-            cumulative[f'top_{self.top_n}_return_pct'] = yearly[f'top_{self.top_n}_return']
-            cumulative['decile_return_pct'] = yearly['decile_return']
-
-            # Calculate cumulative growth of 100
             benchmark_cum = 100.0
             top_n_cum = 100.0
             decile_cum = 100.0
-            cum_benchmark = []
-            cum_top_n = []
-            cum_decile = []
+            cum_rows = []
 
-            for _, row in cumulative.iterrows():
-                benchmark_cum *= (1 + row['benchmark_return_pct'] / 100)
-                top_n_cum *= (1 + row[f'top_{self.top_n}_return_pct'] / 100)
-                decile_cum *= (1 + row['decile_return_pct'] / 100)
-                cum_benchmark.append(round(benchmark_cum, 2))
-                cum_top_n.append(round(top_n_cum, 2))
-                cum_decile.append(round(decile_cum, 2))
+            for r in yearly_results:
+                benchmark_cum *= (1 + r['benchmark_return'] / 100)
+                top_n_cum *= (1 + r['top_n_return'] / 100)
+                decile_cum *= (1 + r['decile_return'] / 100)
+                cum_rows.append({
+                    'year': r['year'],
+                    'benchmark_cumulative': round(benchmark_cum, 2),
+                    f'top_{self.top_n}_cumulative': round(top_n_cum, 2),
+                    'decile_cumulative': round(decile_cum, 2),
+                })
 
-            cumulative['benchmark_cumulative'] = cum_benchmark
-            cumulative[f'top_{self.top_n}_cumulative'] = cum_top_n
-            cumulative['decile_cumulative'] = cum_decile
-            cumulative.to_excel(writer, sheet_name='cumulative_performance', index=False)
+            pd.DataFrame(cum_rows).to_excel(writer, sheet_name='cumulative_performance', index=False)
+
+            # All months detail
+            monthly_detail = pd.DataFrame([{
+                'year': r['year'],
+                'month': r['month'],
+                'n_test': r['n_test'],
+                'auc': round(r['auc'], 3),
+                'benchmark': round(r['benchmark_return'], 2),
+                f'top_{self.top_n}': round(r['top_n_return'], 2),
+                'decile': round(r['decile_return'], 2),
+            } for r in monthly_results])
+            monthly_detail.to_excel(writer, sheet_name='all_months', index=False)
 
             # Model stability - feature importance across years
             importance_data = {}
-            for r in all_results:
+            for r in yearly_results:
                 fi = r['feature_importance'].set_index('feature')['importance']
-                importance_data[r['test_year']] = fi
-
+                importance_data[r['year']] = fi
             if importance_data:
                 stability = pd.DataFrame(importance_data)
                 stability['avg_importance'] = stability.mean(axis=1)
@@ -522,91 +695,76 @@ class WalkForwardTrainer:
                 stability = stability.sort_values('avg_importance', ascending=False)
                 stability.to_excel(writer, sheet_name='model_stability')
 
-            # Average metrics
+            # Summary metrics
             avg_metrics = pd.DataFrame([{
-                'metric': 'Avg Accuracy',
-                'value': round(yearly['accuracy'].mean(), 3),
-            }, {
                 'metric': 'Avg AUC',
-                'value': round(yearly['auc'].mean(), 3),
+                'value': round(yearly_df['avg_auc'].mean(), 3),
             }, {
-                'metric': 'Avg Precision',
-                'value': round(yearly['precision'].mean(), 3),
+                'metric': 'Avg Accuracy',
+                'value': round(yearly_df['avg_accuracy'].mean(), 3),
             }, {
-                'metric': 'Avg Recall',
-                'value': round(yearly['recall'].mean(), 3),
+                'metric': f'Avg Top {self.top_n} Annual Return',
+                'value': round(yearly_df[f'top_{self.top_n}_return'].mean(), 2),
             }, {
-                'metric': 'Avg F1',
-                'value': round(yearly['f1'].mean(), 3),
+                'metric': f'Avg Top {self.top_n} Annual Excess',
+                'value': round(yearly_df[f'top_{self.top_n}_excess'].mean(), 2),
             }, {
-                'metric': f'Avg Top {self.top_n} Return',
-                'value': round(yearly[f'top_{self.top_n}_return'].mean(), 2),
+                'metric': 'Avg Decile Annual Return',
+                'value': round(yearly_df['decile_return'].mean(), 2),
             }, {
-                'metric': f'Avg Top {self.top_n} Excess Return',
-                'value': round(yearly[f'top_{self.top_n}_excess'].mean(), 2),
+                'metric': 'Avg Benchmark Annual Return',
+                'value': round(yearly_df['benchmark_return'].mean(), 2),
             }, {
-                'metric': 'Avg Decile Return',
-                'value': round(yearly['decile_return'].mean(), 2),
+                'metric': 'Final Cumulative - Benchmark',
+                'value': cum_rows[-1]['benchmark_cumulative'] if cum_rows else 0,
             }, {
-                'metric': 'Avg Decile Excess Return',
-                'value': round(yearly['decile_excess'].mean(), 2),
+                'metric': f'Final Cumulative - Top {self.top_n}',
+                'value': cum_rows[-1][f'top_{self.top_n}_cumulative'] if cum_rows else 0,
             }, {
-                'metric': 'Avg Benchmark Return',
-                'value': round(yearly['benchmark_return'].mean(), 2),
-            }, {
-                'metric': f'Final Cumulative (100 invested) - Benchmark',
-                'value': cum_benchmark[-1] if cum_benchmark else 0,
-            }, {
-                'metric': f'Final Cumulative (100 invested) - Top {self.top_n}',
-                'value': cum_top_n[-1] if cum_top_n else 0,
-            }, {
-                'metric': f'Final Cumulative (100 invested) - Decile',
-                'value': cum_decile[-1] if cum_decile else 0,
+                'metric': 'Final Cumulative - Decile',
+                'value': cum_rows[-1]['decile_cumulative'] if cum_rows else 0,
             }, {
                 'metric': 'Years Outperformed (Top N vs Benchmark)',
-                'value': sum(1 for r in all_results if r['top_n_return'] > r['benchmark_return']),
+                'value': sum(1 for r in yearly_results if r['top_n_return'] > r['benchmark_return']),
             }, {
                 'metric': 'Total Test Years',
-                'value': len(all_results),
+                'value': len(yearly_results),
+            }, {
+                'metric': 'Total Test Months',
+                'value': len(monthly_results),
             }])
             avg_metrics.to_excel(writer, sheet_name='summary_metrics', index=False)
 
         print(f"\nSaved summary report: {filepath}")
 
-    def _print_summary(self, all_results: list):
+    def _print_summary(self, yearly_results: list, monthly_results: list):
         """Print final summary to console."""
         print(f"\n{'='*70}")
-        print(f"WALK-FORWARD BACKTEST SUMMARY")
+        print(f"MONTHLY WALK-FORWARD BACKTEST SUMMARY")
         print(f"{'='*70}")
-        print(f"Folds: {len(all_results)}")
-        print(f"Years: {all_results[0]['test_year']} - {all_results[-1]['test_year']}")
+        print(f"Total months tested: {len(monthly_results)}")
+        print(f"Years: {yearly_results[0]['year']} - {yearly_results[-1]['year']}")
 
-        avg_accuracy = np.mean([r['accuracy'] for r in all_results])
-        avg_auc = np.mean([r['auc'] for r in all_results])
-        avg_precision = np.mean([r['precision'] for r in all_results])
-        avg_recall = np.mean([r['recall'] for r in all_results])
-        avg_f1 = np.mean([r['f1'] for r in all_results])
-        avg_benchmark = np.mean([r['benchmark_return'] for r in all_results])
-        avg_top_n = np.mean([r['top_n_return'] for r in all_results])
-        avg_decile = np.mean([r['decile_return'] for r in all_results])
+        avg_auc = np.mean([r['auc'] for r in yearly_results])
+        avg_accuracy = np.mean([r['accuracy'] for r in yearly_results])
+        avg_benchmark = np.mean([r['benchmark_return'] for r in yearly_results])
+        avg_top_n = np.mean([r['top_n_return'] for r in yearly_results])
+        avg_decile = np.mean([r['decile_return'] for r in yearly_results])
 
-        print(f"\nModel Quality:")
-        print(f"  Avg Accuracy:  {avg_accuracy:.1%}")
+        print(f"\nModel Quality (avg across years):")
         print(f"  Avg AUC:       {avg_auc:.3f}")
-        print(f"  Avg Precision:  {avg_precision:.1%}")
-        print(f"  Avg Recall:     {avg_recall:.1%}")
-        print(f"  Avg F1:         {avg_f1:.3f}")
+        print(f"  Avg Accuracy:  {avg_accuracy:.1%}")
 
-        print(f"\nPortfolio Performance (avg annual return):")
+        print(f"\nPortfolio Performance (avg compounded annual return):")
         print(f"  Benchmark (market median):  {avg_benchmark:+.2f}%")
-        print(f"  Top {self.top_n} portfolio:          {avg_top_n:+.2f}%")
+        print(f"  Top {self.top_n} portfolio:         {avg_top_n:+.2f}%")
         print(f"  Top decile portfolio:       {avg_decile:+.2f}%")
 
         # Cumulative
         benchmark_cum = 100.0
         top_n_cum = 100.0
         decile_cum = 100.0
-        for r in all_results:
+        for r in yearly_results:
             benchmark_cum *= (1 + r['benchmark_return'] / 100)
             top_n_cum *= (1 + r['top_n_return'] / 100)
             decile_cum *= (1 + r['decile_return'] / 100)
@@ -616,33 +774,34 @@ class WalkForwardTrainer:
         print(f"  Top {self.top_n} portfolio:  {top_n_cum:.2f}")
         print(f"  Top decile:        {decile_cum:.2f}")
 
-        outperform_count = sum(1 for r in all_results if r['top_n_return'] > r['benchmark_return'])
-        print(f"\nTop {self.top_n} beat benchmark: {outperform_count}/{len(all_results)} years")
+        outperform_count = sum(1 for r in yearly_results if r['top_n_return'] > r['benchmark_return'])
+        print(f"\nTop {self.top_n} beat benchmark: {outperform_count}/{len(yearly_results)} years")
 
-        print(f"\nYear-by-year:")
-        print(f"  {'Year':<6} {'Benchmark':>10} {'Top '+str(self.top_n):>10} {'Decile':>10} {'Beat?':>6}")
-        print(f"  {'-'*44}")
-        for r in all_results:
+        print(f"\nYear-by-year (compounded monthly returns):")
+        print(f"  {'Year':<6} {'Months':>6} {'Benchmark':>10} {'Top '+str(self.top_n):>10} {'Decile':>10} {'Beat?':>6}")
+        print(f"  {'-'*50}")
+        for r in yearly_results:
             beat = 'YES' if r['top_n_return'] > r['benchmark_return'] else 'no'
-            print(f"  {r['test_year']:<6} {r['benchmark_return']:>+9.2f}% {r['top_n_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}")
+            print(f"  {r['year']:<6} {r['n_months']:>6} {r['benchmark_return']:>+9.2f}% "
+                  f"{r['top_n_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}")
 
         print(f"\nOutputs saved to: {os.path.abspath(self.output_dir)}/")
-        print(f"  debug/   - Excel files with raw data per year")
-        print(f"  reports/ - Performance reports per year + summary")
+        print(f"  debug/   - Model inputs + outputs per month")
+        print(f"  reports/ - Yearly performance reports + summary")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Walk-forward excess return model with portfolio backtest')
+        description='Monthly walk-forward outperformance model with portfolio backtest')
     parser.add_argument('--db-host', default=os.getenv('DB_HOST', 'localhost'))
     parser.add_argument('--db-name', default=os.getenv('DB_NAME', 'borsdata'))
     parser.add_argument('--db-user', default=os.getenv('DB_USER', 'postgres'))
     parser.add_argument('--db-password', default=os.getenv('DB_PASSWORD'))
     parser.add_argument('--db-port', type=int, default=int(os.getenv('DB_PORT', 5432)))
-    parser.add_argument('--min-train-years', type=int, default=3,
-                        help='Minimum years of training data before first prediction (default: 3)')
-    parser.add_argument('--top-n', type=int, default=10,
-                        help='Number of top stocks to pick each year (default: 10)')
+    parser.add_argument('--min-train-months', type=int, default=36,
+                        help='Minimum months of training data before first prediction (default: 36)')
+    parser.add_argument('--top-n', type=int, default=20,
+                        help='Number of top stocks to pick each month (default: 20)')
     parser.add_argument('--output-dir', default='results',
                         help='Output directory for debug and report files (default: results)')
 
@@ -660,10 +819,10 @@ def main():
         'port': args.db_port
     }
 
-    trainer = WalkForwardTrainer(
+    trainer = MonthlyWalkForwardTrainer(
         db_config,
         output_dir=args.output_dir,
-        min_train_years=args.min_train_years,
+        min_train_months=args.min_train_months,
         top_n=args.top_n
     )
 

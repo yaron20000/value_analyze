@@ -5,6 +5,8 @@
 
 -- Drop ML tables if they exist
 DROP VIEW IF EXISTS ml_training_data CASCADE;
+DROP TABLE IF EXISTS ml_monthly_price_features CASCADE;
+DROP TABLE IF EXISTS ml_monthly_targets CASCADE;
 DROP TABLE IF EXISTS ml_holdings_features CASCADE;
 DROP TABLE IF EXISTS ml_pre_report_features CASCADE;
 DROP TABLE IF EXISTS ml_targets CASCADE;
@@ -305,3 +307,66 @@ COMMENT ON COLUMN ml_features.period IS '3=Q1, 5=full year - filter on 5 for ann
 COMMENT ON COLUMN ml_targets.next_year_return IS 'Stock return from year Y to year Y+1 (%)';
 COMMENT ON COLUMN ml_targets.next_year_dividend_growth IS 'Dividend growth from year Y to year Y+1 (%)';
 COMMENT ON COLUMN ml_pre_report_features.was_rising_5d IS 'Key feature: was stock rising before report (anticipation signal)';
+
+-- =============================================================================
+-- 6. MONTHLY TARGETS - For monthly walk-forward model
+-- =============================================================================
+CREATE TABLE ml_monthly_targets (
+    instrument_id INTEGER NOT NULL,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+
+    month_end_date DATE,
+    month_end_price NUMERIC(15,4),
+
+    next_month_return NUMERIC(10,4),
+    market_median_monthly_return NUMERIC(10,4),
+    next_month_excess_return NUMERIC(10,4),
+
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (instrument_id, year, month)
+);
+
+CREATE INDEX idx_ml_monthly_targets_instrument ON ml_monthly_targets(instrument_id);
+CREATE INDEX idx_ml_monthly_targets_yearmonth ON ml_monthly_targets(year, month);
+
+COMMENT ON TABLE ml_monthly_targets IS 'Monthly stock returns for monthly walk-forward model';
+COMMENT ON COLUMN ml_monthly_targets.next_month_return IS 'Percentage return from end of month M to end of month M+1';
+
+-- =============================================================================
+-- 7. MONTHLY PRICE FEATURES - Technical features as of each month-end
+-- =============================================================================
+CREATE TABLE ml_monthly_price_features (
+    instrument_id INTEGER NOT NULL,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+
+    month_end_date DATE,
+
+    price_change_5d NUMERIC(10,4),
+    price_change_10d NUMERIC(10,4),
+    price_change_20d NUMERIC(10,4),
+    price_change_30d NUMERIC(10,4),
+
+    volume_ratio_5d_20d NUMERIC(10,4),
+
+    volatility_5d NUMERIC(10,6),
+    volatility_20d NUMERIC(10,6),
+
+    was_rising_5d BOOLEAN,
+    was_rising_10d BOOLEAN,
+    was_rising_20d BOOLEAN,
+
+    pct_from_20d_high NUMERIC(10,4),
+    pct_from_20d_low NUMERIC(10,4),
+
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (instrument_id, year, month)
+);
+
+CREATE INDEX idx_ml_monthly_price_instrument ON ml_monthly_price_features(instrument_id);
+CREATE INDEX idx_ml_monthly_price_yearmonth ON ml_monthly_price_features(year, month);
+
+COMMENT ON TABLE ml_monthly_price_features IS 'Price-based features computed as of each month-end for monthly model';

@@ -965,18 +965,237 @@ class MLTransformer:
         total = self.cursor.fetchone()[0]
         print(f"✓ Holdings features total: {total} (instrument, year) rows")
 
-    def run_migrations(self):
-        """Run SQL migration to ensure schema is up to date."""
-        migration_path = os.path.join(os.path.dirname(__file__), 'migration_gap_fix.sql')
-        if not os.path.exists(migration_path):
-            print("⚠ Migration file not found, skipping schema update")
-            return
-        print("Running schema migrations...")
-        with open(migration_path, 'r') as f:
-            sql = f.read()
-        self.cursor.execute(sql)
+    def calculate_monthly_targets(self, instrument_id: int = None):
+        """
+        Calculate monthly stock return targets from ml_stock_prices.
+
+        For each (instrument, year, month), compute:
+        - month_end_price: closing price on the last trading day of the month
+        - next_month_return: % return from this month-end to next month-end
+        - market_median_monthly_return: median of all stocks' next_month_return
+        - next_month_excess_return: stock return minus median
+        """
+        print(f"Calculating monthly targets{f' for instrument {instrument_id}' if instrument_id else ''}...")
+
+        where_clause = ""
+        if instrument_id:
+            where_clause = f"AND me.instrument_id = {instrument_id}"
+
+        query = f"""
+        WITH month_end_prices AS (
+            -- Get the last trading day's close for each (instrument, year, month)
+            SELECT DISTINCT ON (instrument_id, EXTRACT(YEAR FROM date), EXTRACT(MONTH FROM date))
+                instrument_id,
+                EXTRACT(YEAR FROM date)::integer as year,
+                EXTRACT(MONTH FROM date)::integer as month,
+                date as month_end_date,
+                close as month_end_price
+            FROM ml_stock_prices
+            WHERE close IS NOT NULL AND close > 0
+            ORDER BY instrument_id, EXTRACT(YEAR FROM date), EXTRACT(MONTH FROM date), date DESC
+        ),
+        with_next AS (
+            SELECT
+                me.*,
+                LEAD(month_end_price) OVER (
+                    PARTITION BY instrument_id ORDER BY year, month
+                ) as next_month_price,
+                LEAD(year) OVER (
+                    PARTITION BY instrument_id ORDER BY year, month
+                ) as next_year,
+                LEAD(month) OVER (
+                    PARTITION BY instrument_id ORDER BY year, month
+                ) as next_month
+            FROM month_end_prices me
+        ),
+        returns AS (
+            SELECT
+                instrument_id, year, month, month_end_date, month_end_price,
+                CASE
+                    -- Only calculate return if next month is actually the consecutive month
+                    WHEN next_month_price IS NOT NULL
+                        AND (year * 12 + month + 1) = (next_year * 12 + next_month)
+                    THEN ((next_month_price - month_end_price) / month_end_price) * 100
+                END as next_month_return
+            FROM with_next
+            WHERE 1=1 {where_clause}
+        ),
+        market_median AS (
+            SELECT
+                year, month,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY next_month_return) as median_return
+            FROM returns
+            WHERE next_month_return IS NOT NULL
+            GROUP BY year, month
+        )
+        INSERT INTO ml_monthly_targets (
+            instrument_id, year, month,
+            month_end_date, month_end_price,
+            next_month_return, market_median_monthly_return, next_month_excess_return
+        )
+        SELECT
+            r.instrument_id, r.year, r.month,
+            r.month_end_date, r.month_end_price,
+            r.next_month_return,
+            m.median_return,
+            CASE WHEN r.next_month_return IS NOT NULL AND m.median_return IS NOT NULL
+                THEN r.next_month_return - m.median_return ELSE NULL END
+        FROM returns r
+        LEFT JOIN market_median m ON r.year = m.year AND r.month = m.month
+        ON CONFLICT (instrument_id, year, month) DO UPDATE SET
+            month_end_date = EXCLUDED.month_end_date,
+            month_end_price = EXCLUDED.month_end_price,
+            next_month_return = EXCLUDED.next_month_return,
+            market_median_monthly_return = EXCLUDED.market_median_monthly_return,
+            next_month_excess_return = EXCLUDED.next_month_excess_return
+        """
+
+        self.cursor.execute(query)
+        rows = self.cursor.rowcount
         self.conn.commit()
-        print("✓ Schema migrations applied")
+        print(f"✓ Monthly targets: {rows} (instrument, year, month) rows")
+
+    def calculate_monthly_price_features(self, instrument_id: int = None):
+        """
+        Calculate price-based features as of each month-end.
+
+        Same features as pre-report features but anchored to month-end dates:
+        - Momentum: price change over 5/10/20/30 days
+        - Volume: ratio of recent to longer-term average
+        - Volatility: std dev of daily returns
+        - Trend: was price rising?
+        - Relative position: distance from 20-day high/low
+        """
+        print(f"Calculating monthly price features{f' for instrument {instrument_id}' if instrument_id else ''}...")
+
+        where_clause = ""
+        if instrument_id:
+            where_clause = f"AND mt.instrument_id = {instrument_id}"
+
+        query = f"""
+        WITH month_ends AS (
+            SELECT DISTINCT instrument_id, year, month, month_end_date
+            FROM ml_monthly_targets
+            WHERE month_end_date IS NOT NULL
+            {'AND instrument_id = ' + str(instrument_id) if instrument_id else ''}
+        ),
+        price_windows AS (
+            SELECT
+                me.instrument_id,
+                me.year,
+                me.month,
+                me.month_end_date,
+                sp.date as price_date,
+                sp.close,
+                sp.volume,
+                sp.daily_return,
+                me.month_end_date - sp.date as days_before
+            FROM month_ends me
+            JOIN ml_stock_prices sp ON me.instrument_id = sp.instrument_id
+            WHERE sp.date >= me.month_end_date - INTERVAL '40 days'
+              AND sp.date <= me.month_end_date
+              AND sp.close IS NOT NULL AND sp.close > 0
+        ),
+        aggregated AS (
+            SELECT
+                instrument_id, year, month, month_end_date,
+
+                -- Price at month-end (days_before = 0)
+                MAX(CASE WHEN days_before = 0 THEN close END) as price_at_end,
+
+                -- Prices at N days before (closest available day in range)
+                MAX(CASE WHEN days_before BETWEEN 4 AND 7 THEN close END) as price_5d_before,
+                MAX(CASE WHEN days_before BETWEEN 9 AND 14 THEN close END) as price_10d_before,
+                MAX(CASE WHEN days_before BETWEEN 18 AND 25 THEN close END) as price_20d_before,
+                MAX(CASE WHEN days_before BETWEEN 28 AND 35 THEN close END) as price_30d_before,
+
+                -- Volume averages
+                AVG(CASE WHEN days_before <= 7 THEN volume END) as avg_volume_5d,
+                AVG(CASE WHEN days_before <= 25 THEN volume END) as avg_volume_20d,
+
+                -- Volatility (std dev of daily returns)
+                STDDEV(CASE WHEN days_before <= 7 THEN daily_return END) as volatility_5d,
+                STDDEV(CASE WHEN days_before <= 25 THEN daily_return END) as volatility_20d,
+
+                -- 20-day high/low
+                MAX(CASE WHEN days_before <= 25 THEN close END) as high_20d,
+                MIN(CASE WHEN days_before <= 25 THEN close END) as low_20d
+
+            FROM price_windows
+            GROUP BY instrument_id, year, month, month_end_date
+        )
+        INSERT INTO ml_monthly_price_features (
+            instrument_id, year, month, month_end_date,
+            price_change_5d, price_change_10d, price_change_20d, price_change_30d,
+            volume_ratio_5d_20d,
+            volatility_5d, volatility_20d,
+            was_rising_5d, was_rising_10d, was_rising_20d,
+            pct_from_20d_high, pct_from_20d_low
+        )
+        SELECT
+            instrument_id, year, month, month_end_date,
+
+            CASE WHEN price_5d_before > 0
+                THEN ((price_at_end - price_5d_before) / price_5d_before) * 100 END,
+            CASE WHEN price_10d_before > 0
+                THEN ((price_at_end - price_10d_before) / price_10d_before) * 100 END,
+            CASE WHEN price_20d_before > 0
+                THEN ((price_at_end - price_20d_before) / price_20d_before) * 100 END,
+            CASE WHEN price_30d_before > 0
+                THEN ((price_at_end - price_30d_before) / price_30d_before) * 100 END,
+
+            CASE WHEN avg_volume_20d > 0
+                THEN avg_volume_5d / avg_volume_20d END,
+
+            volatility_5d,
+            volatility_20d,
+
+            price_at_end > price_5d_before,
+            price_at_end > price_10d_before,
+            price_at_end > price_20d_before,
+
+            CASE WHEN high_20d > 0
+                THEN ((price_at_end - high_20d) / high_20d) * 100 END,
+            CASE WHEN low_20d > 0
+                THEN ((price_at_end - low_20d) / low_20d) * 100 END
+
+        FROM aggregated
+        WHERE price_at_end IS NOT NULL
+        ON CONFLICT (instrument_id, year, month) DO UPDATE SET
+            month_end_date = EXCLUDED.month_end_date,
+            price_change_5d = EXCLUDED.price_change_5d,
+            price_change_10d = EXCLUDED.price_change_10d,
+            price_change_20d = EXCLUDED.price_change_20d,
+            price_change_30d = EXCLUDED.price_change_30d,
+            volume_ratio_5d_20d = EXCLUDED.volume_ratio_5d_20d,
+            volatility_5d = EXCLUDED.volatility_5d,
+            volatility_20d = EXCLUDED.volatility_20d,
+            was_rising_5d = EXCLUDED.was_rising_5d,
+            was_rising_10d = EXCLUDED.was_rising_10d,
+            was_rising_20d = EXCLUDED.was_rising_20d,
+            pct_from_20d_high = EXCLUDED.pct_from_20d_high,
+            pct_from_20d_low = EXCLUDED.pct_from_20d_low
+        """
+
+        self.cursor.execute(query)
+        rows = self.cursor.rowcount
+        self.conn.commit()
+        print(f"✓ Monthly price features: {rows} (instrument, year, month) rows")
+
+    def run_migrations(self):
+        """Run SQL migrations to ensure schema is up to date."""
+        base_dir = os.path.dirname(__file__)
+        migrations = ['migration_gap_fix.sql', 'migration_monthly.sql']
+        for migration_file in migrations:
+            migration_path = os.path.join(base_dir, migration_file)
+            if not os.path.exists(migration_path):
+                continue
+            print(f"Running migration: {migration_file}...")
+            with open(migration_path, 'r') as f:
+                sql = f.read()
+            self.cursor.execute(sql)
+            self.conn.commit()
+            print(f"✓ {migration_file} applied")
 
     def run(self, instrument_id: int = None):
         """Run full transformation pipeline."""
@@ -996,6 +1215,10 @@ class MLTransformer:
             self.calculate_return_targets(instrument_id)
             self.calculate_pre_report_features(instrument_id)
             self.transform_holdings_data(instrument_id)
+
+            # Monthly tables for monthly walk-forward model
+            self.calculate_monthly_targets(instrument_id)
+            self.calculate_monthly_price_features(instrument_id)
 
             duration = (datetime.now() - start_time).total_seconds()
             print(f"\n{'='*60}")
