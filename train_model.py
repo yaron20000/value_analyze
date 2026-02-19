@@ -32,6 +32,8 @@ import psycopg2
 import argparse
 import os
 import sys
+import json
+import urllib.request
 from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
@@ -41,6 +43,55 @@ warnings.filterwarnings('ignore')
 
 from dotenv import load_dotenv
 load_dotenv()
+
+
+NORDIC_INDEXES = {
+    'OMXS30': {'orderbookId': 19002, 'country': 'Sweden', 'name': 'OMX Stockholm 30'},
+    'OMXC25': {'orderbookId': 731293, 'country': 'Denmark', 'name': 'OMX Copenhagen 25'},
+    'OMXH25': {'orderbookId': 53295, 'country': 'Finland', 'name': 'OMX Helsinki 25'},
+    'OSEBX':  {'orderbookId': 53294, 'country': 'Norway', 'name': 'Oslo Børs Benchmark'},
+}
+
+
+def fetch_nordic_index_returns() -> dict:
+    """
+    Fetch monthly close prices from Avanza for each Nordic index
+    and compute monthly returns.
+
+    Returns dict: {ticker: {(year, month): monthly_return_pct, ...}, ...}
+    """
+    base_url = "https://www.avanza.se/_api/price-chart/stock/{}?timePeriod=five_years&resolution=month"
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+    index_returns = {}
+
+    for ticker, info in NORDIC_INDEXES.items():
+        url = base_url.format(info['orderbookId'])
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+
+            ohlc = data.get('ohlc', [])
+            if len(ohlc) < 2:
+                print(f"  Warning: {ticker} returned {len(ohlc)} data points, skipping")
+                continue
+
+            monthly = {}
+            for i in range(1, len(ohlc)):
+                prev_close = ohlc[i - 1]['close']
+                cur_close = ohlc[i]['close']
+                ts = datetime.fromtimestamp(ohlc[i]['timestamp'] / 1000)
+                ret = (cur_close / prev_close - 1) * 100
+                monthly[(ts.year, ts.month)] = ret
+
+            index_returns[ticker] = monthly
+            print(f"  {ticker}: {len(monthly)} monthly returns "
+                  f"({min(monthly.keys())} to {max(monthly.keys())})")
+
+        except Exception as e:
+            print(f"  Warning: Failed to fetch {ticker}: {e}")
+
+    return index_returns
 
 
 class MonthlyWalkForwardTrainer:
@@ -53,6 +104,7 @@ class MonthlyWalkForwardTrainer:
         self.output_dir = output_dir
         self.min_train_months = min_train_months
         self.top_n = top_n
+        self.index_returns = {}  # populated before walk-forward
 
         # Fundamental feature columns (from annual reports)
         self.fundamental_cols = [
@@ -337,6 +389,10 @@ class MonthlyWalkForwardTrainer:
             targets_df, fundamentals_df, price_features_df, holdings_df
         )
 
+        # Fetch Nordic index returns from Avanza
+        print("\nFetching Nordic index monthly returns from Avanza...")
+        self.index_returns = fetch_nordic_index_returns()
+
         # Filter to rows with valid target and fundamentals
         df_valid = df[df[self.target_col].notna() & df['report_date'].notna()].copy()
         print(f"\nValid rows for training: {len(df_valid)}")
@@ -424,7 +480,15 @@ class MonthlyWalkForwardTrainer:
             decile_return = top_decile_picks['next_month_return'].mean()
             decile_excess = top_decile_picks[self.target_col].mean()
 
-            print(f" | Top{self.top_n}={top_n_return:+.2f}% Bench={benchmark_return:+.2f}%")
+            # Look up Nordic index returns for this month
+            month_index_returns = {}
+            for ticker, returns_dict in self.index_returns.items():
+                month_index_returns[ticker] = returns_dict.get((test_year, test_month))
+
+            idx_str = ''.join(
+                f" {t}={r:+.1f}%" for t, r in month_index_returns.items() if r is not None
+            )
+            print(f" | Top{self.top_n}={top_n_return:+.2f}% Bench={benchmark_return:+.2f}%{idx_str}")
 
             # Feature importance
             feature_importance = pd.DataFrame({
@@ -449,6 +513,7 @@ class MonthlyWalkForwardTrainer:
                 'decile_return': decile_return,
                 'decile_excess': decile_excess,
                 'decile_size': decile_size,
+                'index_returns': month_index_returns,
                 'feature_importance': feature_importance,
                 'top_n_picks': top_n_picks,
                 'top_decile_picks': top_decile_picks,
@@ -513,6 +578,7 @@ class MonthlyWalkForwardTrainer:
                     'benchmark_monthly': [],
                     'top_n_monthly': [],
                     'decile_monthly': [],
+                    'index_monthly': {t: [] for t in NORDIC_INDEXES},
                     'accuracies': [],
                     'aucs': [],
                     'precisions': [],
@@ -529,6 +595,9 @@ class MonthlyWalkForwardTrainer:
             yearly[y]['benchmark_monthly'].append(mr['benchmark_return'])
             yearly[y]['top_n_monthly'].append(mr['top_n_return'])
             yearly[y]['decile_monthly'].append(mr['decile_return'])
+            for ticker in NORDIC_INDEXES:
+                val = mr.get('index_returns', {}).get(ticker)
+                yearly[y]['index_monthly'][ticker].append(val)
             yearly[y]['accuracies'].append(mr['accuracy'])
             yearly[y]['aucs'].append(mr['auc'])
             yearly[y]['precisions'].append(mr['precision'])
@@ -549,6 +618,15 @@ class MonthlyWalkForwardTrainer:
             benchmark_compound = (np.prod([1 + r/100 for r in yd['benchmark_monthly']]) - 1) * 100
             top_n_compound = (np.prod([1 + r/100 for r in yd['top_n_monthly']]) - 1) * 100
             decile_compound = (np.prod([1 + r/100 for r in yd['decile_monthly']]) - 1) * 100
+
+            # Compound index returns (skip months with missing data)
+            index_compound = {}
+            for ticker in NORDIC_INDEXES:
+                vals = [r for r in yd['index_monthly'][ticker] if r is not None]
+                if vals:
+                    index_compound[ticker] = (np.prod([1 + r/100 for r in vals]) - 1) * 100
+                else:
+                    index_compound[ticker] = None
 
             # Average feature importance across months
             all_fi = pd.concat(yd['feature_importances'])
@@ -572,6 +650,8 @@ class MonthlyWalkForwardTrainer:
                 'decile_return': decile_compound,
                 'decile_excess': decile_compound - benchmark_compound,
                 'decile_size_avg': int(np.mean(yd['decile_sizes'])),
+                'index_returns': index_compound,
+                'index_monthly': yd['index_monthly'],
                 'feature_importance': avg_fi,
                 'monthly_benchmark': yd['benchmark_monthly'],
                 'monthly_top_n': yd['top_n_monthly'],
@@ -589,7 +669,7 @@ class MonthlyWalkForwardTrainer:
 
             with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
                 # Model performance
-                perf = pd.DataFrame([{
+                perf_row = {
                     'year': yr['year'],
                     'months_tested': yr['n_months'],
                     'avg_train_samples': yr['n_train_avg'],
@@ -604,16 +684,24 @@ class MonthlyWalkForwardTrainer:
                     f'top_{self.top_n}_excess': round(yr['top_n_excess'], 2),
                     'decile_return_compounded': round(yr['decile_return'], 2),
                     'decile_excess': round(yr['decile_excess'], 2),
-                }])
+                }
+                for ticker in NORDIC_INDEXES:
+                    val = yr.get('index_returns', {}).get(ticker)
+                    perf_row[f'{ticker}_return'] = round(val, 2) if val is not None else None
+                perf = pd.DataFrame([perf_row])
                 perf.to_excel(writer, sheet_name='performance', index=False)
 
                 # Monthly breakdown
-                monthly_data = pd.DataFrame({
+                monthly_dict = {
                     'month': yr['months'],
                     'benchmark_return': [round(r, 2) for r in yr['monthly_benchmark']],
                     f'top_{self.top_n}_return': [round(r, 2) for r in yr['monthly_top_n']],
                     'decile_return': [round(r, 2) for r in yr['monthly_decile']],
-                })
+                }
+                for ticker in NORDIC_INDEXES:
+                    vals = yr.get('index_monthly', {}).get(ticker, [])
+                    monthly_dict[ticker] = [round(v, 2) if v is not None else None for v in vals]
+                monthly_data = pd.DataFrame(monthly_dict)
                 monthly_data.to_excel(writer, sheet_name='monthly_breakdown', index=False)
 
                 # Feature importance (avg across months)
@@ -638,49 +726,70 @@ class MonthlyWalkForwardTrainer:
 
         with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
             # Yearly overview
-            yearly_df = pd.DataFrame([{
-                'year': r['year'],
-                'months': r['n_months'],
-                'avg_auc': round(r['auc'], 3),
-                'avg_accuracy': round(r['accuracy'], 3),
-                'benchmark_return': round(r['benchmark_return'], 2),
-                f'top_{self.top_n}_return': round(r['top_n_return'], 2),
-                f'top_{self.top_n}_excess': round(r['top_n_excess'], 2),
-                'decile_return': round(r['decile_return'], 2),
-                'decile_excess': round(r['decile_excess'], 2),
-                'decile_size_avg': r['decile_size_avg'],
-            } for r in yearly_results])
+            yearly_rows = []
+            for r in yearly_results:
+                row = {
+                    'year': r['year'],
+                    'months': r['n_months'],
+                    'avg_auc': round(r['auc'], 3),
+                    'avg_accuracy': round(r['accuracy'], 3),
+                    'benchmark_return': round(r['benchmark_return'], 2),
+                    f'top_{self.top_n}_return': round(r['top_n_return'], 2),
+                    f'top_{self.top_n}_excess': round(r['top_n_excess'], 2),
+                    'decile_return': round(r['decile_return'], 2),
+                    'decile_excess': round(r['decile_excess'], 2),
+                    'decile_size_avg': r['decile_size_avg'],
+                }
+                for ticker in NORDIC_INDEXES:
+                    val = r.get('index_returns', {}).get(ticker)
+                    row[ticker] = round(val, 2) if val is not None else None
+                yearly_rows.append(row)
+            yearly_df = pd.DataFrame(yearly_rows)
             yearly_df.to_excel(writer, sheet_name='yearly_overview', index=False)
 
             # Cumulative performance (invest 100 at start)
             benchmark_cum = 100.0
             top_n_cum = 100.0
             decile_cum = 100.0
+            index_cum = {t: 100.0 for t in NORDIC_INDEXES}
             cum_rows = []
 
             for r in yearly_results:
                 benchmark_cum *= (1 + r['benchmark_return'] / 100)
                 top_n_cum *= (1 + r['top_n_return'] / 100)
                 decile_cum *= (1 + r['decile_return'] / 100)
-                cum_rows.append({
+                row = {
                     'year': r['year'],
                     'benchmark_cumulative': round(benchmark_cum, 2),
                     f'top_{self.top_n}_cumulative': round(top_n_cum, 2),
                     'decile_cumulative': round(decile_cum, 2),
-                })
+                }
+                for ticker in NORDIC_INDEXES:
+                    val = r.get('index_returns', {}).get(ticker)
+                    if val is not None:
+                        index_cum[ticker] *= (1 + val / 100)
+                    row[f'{ticker}_cumulative'] = round(index_cum[ticker], 2)
+                cum_rows.append(row)
 
             pd.DataFrame(cum_rows).to_excel(writer, sheet_name='cumulative_performance', index=False)
 
             # All months detail
-            monthly_detail = pd.DataFrame([{
-                'year': r['year'],
-                'month': r['month'],
-                'n_test': r['n_test'],
-                'auc': round(r['auc'], 3),
-                'benchmark': round(r['benchmark_return'], 2),
-                f'top_{self.top_n}': round(r['top_n_return'], 2),
-                'decile': round(r['decile_return'], 2),
-            } for r in monthly_results])
+            monthly_detail_rows = []
+            for r in monthly_results:
+                row = {
+                    'year': r['year'],
+                    'month': r['month'],
+                    'n_test': r['n_test'],
+                    'auc': round(r['auc'], 3),
+                    'benchmark': round(r['benchmark_return'], 2),
+                    f'top_{self.top_n}': round(r['top_n_return'], 2),
+                    'decile': round(r['decile_return'], 2),
+                }
+                for ticker in NORDIC_INDEXES:
+                    val = r.get('index_returns', {}).get(ticker)
+                    row[ticker] = round(val, 2) if val is not None else None
+                monthly_detail_rows.append(row)
+            monthly_detail = pd.DataFrame(monthly_detail_rows)
             monthly_detail.to_excel(writer, sheet_name='all_months', index=False)
 
             # Model stability - feature importance across years
@@ -696,7 +805,7 @@ class MonthlyWalkForwardTrainer:
                 stability.to_excel(writer, sheet_name='model_stability')
 
             # Summary metrics
-            avg_metrics = pd.DataFrame([{
+            metrics_rows = [{
                 'metric': 'Avg AUC',
                 'value': round(yearly_df['avg_auc'].mean(), 3),
             }, {
@@ -723,7 +832,13 @@ class MonthlyWalkForwardTrainer:
             }, {
                 'metric': 'Final Cumulative - Decile',
                 'value': cum_rows[-1]['decile_cumulative'] if cum_rows else 0,
-            }, {
+            }]
+            for ticker, info in NORDIC_INDEXES.items():
+                metrics_rows.append({
+                    'metric': f'Final Cumulative - {ticker} ({info["country"]})',
+                    'value': cum_rows[-1].get(f'{ticker}_cumulative', 0) if cum_rows else 0,
+                })
+            metrics_rows.extend([{
                 'metric': 'Years Outperformed (Top N vs Benchmark)',
                 'value': sum(1 for r in yearly_results if r['top_n_return'] > r['benchmark_return']),
             }, {
@@ -733,7 +848,7 @@ class MonthlyWalkForwardTrainer:
                 'metric': 'Total Test Months',
                 'value': len(monthly_results),
             }])
-            avg_metrics.to_excel(writer, sheet_name='summary_metrics', index=False)
+            pd.DataFrame(metrics_rows).to_excel(writer, sheet_name='summary_metrics', index=False)
 
         print(f"\nSaved summary report: {filepath}")
 
@@ -760,30 +875,54 @@ class MonthlyWalkForwardTrainer:
         print(f"  Top {self.top_n} portfolio:         {avg_top_n:+.2f}%")
         print(f"  Top decile portfolio:       {avg_decile:+.2f}%")
 
+        # Avg index returns
+        for ticker, info in NORDIC_INDEXES.items():
+            vals = [r['index_returns'].get(ticker) for r in yearly_results
+                    if r.get('index_returns', {}).get(ticker) is not None]
+            if vals:
+                print(f"  {ticker} ({info['country']}):  {np.mean(vals):>+14.2f}%")
+
         # Cumulative
         benchmark_cum = 100.0
         top_n_cum = 100.0
         decile_cum = 100.0
+        index_cum = {t: 100.0 for t in NORDIC_INDEXES}
         for r in yearly_results:
             benchmark_cum *= (1 + r['benchmark_return'] / 100)
             top_n_cum *= (1 + r['top_n_return'] / 100)
             decile_cum *= (1 + r['decile_return'] / 100)
+            for ticker in NORDIC_INDEXES:
+                val = r.get('index_returns', {}).get(ticker)
+                if val is not None:
+                    index_cum[ticker] *= (1 + val / 100)
 
         print(f"\nCumulative Growth (100 invested at start):")
         print(f"  Benchmark:         {benchmark_cum:.2f}")
         print(f"  Top {self.top_n} portfolio:  {top_n_cum:.2f}")
         print(f"  Top decile:        {decile_cum:.2f}")
+        for ticker, info in NORDIC_INDEXES.items():
+            print(f"  {ticker:17s}  {index_cum[ticker]:.2f}")
 
         outperform_count = sum(1 for r in yearly_results if r['top_n_return'] > r['benchmark_return'])
         print(f"\nTop {self.top_n} beat benchmark: {outperform_count}/{len(yearly_results)} years")
 
+        # Build dynamic header for index columns
+        idx_tickers = [t for t in NORDIC_INDEXES
+                       if any(r.get('index_returns', {}).get(t) is not None for r in yearly_results)]
+        idx_header = ''.join(f' {t:>8}' for t in idx_tickers)
+        idx_sep = '-' * (8 * len(idx_tickers) + len(idx_tickers))
+
         print(f"\nYear-by-year (compounded monthly returns):")
-        print(f"  {'Year':<6} {'Months':>6} {'Benchmark':>10} {'Top '+str(self.top_n):>10} {'Decile':>10} {'Beat?':>6}")
-        print(f"  {'-'*50}")
+        print(f"  {'Year':<6} {'Months':>6} {'Benchmark':>10} {'Top '+str(self.top_n):>10} {'Decile':>10} {'Beat?':>6}{idx_header}")
+        print(f"  {'-'*50}{idx_sep}")
         for r in yearly_results:
             beat = 'YES' if r['top_n_return'] > r['benchmark_return'] else 'no'
+            idx_vals = ''
+            for t in idx_tickers:
+                v = r.get('index_returns', {}).get(t)
+                idx_vals += f' {v:>+7.1f}%' if v is not None else f' {"N/A":>8}'
             print(f"  {r['year']:<6} {r['n_months']:>6} {r['benchmark_return']:>+9.2f}% "
-                  f"{r['top_n_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}")
+                  f"{r['top_n_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}{idx_vals}")
 
         print(f"\nOutputs saved to: {os.path.abspath(self.output_dir)}/")
         print(f"  debug/   - Model inputs + outputs per month")
