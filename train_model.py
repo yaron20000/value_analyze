@@ -520,10 +520,12 @@ class MonthlyWalkForwardTrainer:
             }
             all_monthly_results.append(monthly_result)
 
-            # Save debug Excel (model inputs + outputs only)
+            # Save debug Excel
             self._save_debug_excel(
-                debug_dir, test_year, test_month, test_df,
-                X_test, available_cols, proba, predictions
+                debug_dir, test_year, test_month,
+                train_df, test_df, ranked,
+                X_test, available_cols, _train_medians,
+                proba, predictions
             )
 
         if not all_monthly_results:
@@ -541,27 +543,59 @@ class MonthlyWalkForwardTrainer:
         self._print_summary(yearly_results, all_monthly_results)
 
     def _save_debug_excel(self, debug_dir: str, year: int, month: int,
-                          test_df: pd.DataFrame, X_test_scaled: np.ndarray,
-                          available_cols: list, proba: np.ndarray,
-                          predictions: np.ndarray):
-        """Save debug data: only model inputs (scaled features) and outputs."""
+                          train_df: pd.DataFrame, test_df: pd.DataFrame,
+                          ranked: pd.DataFrame, X_test_scaled: np.ndarray,
+                          available_cols: list, train_medians: pd.Series,
+                          proba: np.ndarray, predictions: np.ndarray):
+        """Save debug data for one fold to Excel."""
         filepath = os.path.join(debug_dir, f'month_{year}_{month:02d}.xlsx')
 
-        # Build prediction input snapshot: exact scaled values + outputs
-        id_data = {}
-        for col in ['instrument_id', 'company_name', 'sector']:
-            if col in test_df.columns:
-                id_data[col] = test_df[col].values
-
-        debug_df = pd.DataFrame(id_data, index=test_df.index)
-        for j, col in enumerate(available_cols):
-            debug_df[col] = X_test_scaled[:, j]
-        debug_df['score'] = proba
-        debug_df['predicted_outperform'] = predictions
+        id_cols = ['instrument_id', 'year', 'month', 'company_name', 'sector']
+        target_cols = [self.target_col, 'next_month_return', 'market_median_monthly_return']
 
         with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
-            debug_df.sort_values('score', ascending=False).to_excel(
-                writer, sheet_name='model_input_output', index=False
+            # Train data (features + targets)
+            train_export_cols = [c for c in id_cols + available_cols + target_cols if c in train_df.columns]
+            train_df[train_export_cols].to_excel(writer, sheet_name='train_data', index=False)
+
+            # Test data with predictions
+            test_export_cols = [c for c in id_cols + available_cols + target_cols if c in test_df.columns]
+            test_export = test_df[test_export_cols].copy()
+            if 'score' in test_df.columns:
+                test_export['score'] = test_df['score'].values
+            test_export.to_excel(writer, sheet_name='test_data', index=False)
+
+            # Feature statistics (train set)
+            feature_stats = train_df[available_cols].describe().T
+            feature_stats['missing_pct'] = (train_df[available_cols].isna().sum() / len(train_df) * 100)
+            feature_stats['median_impute_value'] = train_medians[available_cols]
+            feature_stats.to_excel(writer, sheet_name='feature_stats')
+
+            # Top N picks
+            pick_cols = [c for c in ['rank', 'instrument_id', 'company_name', 'sector',
+                                      'score', self.target_col,
+                                      'next_month_return', 'market_median_monthly_return'] if c in ranked.columns]
+            ranked.head(self.top_n)[pick_cols].to_excel(writer, sheet_name='top_n_picks', index=False)
+
+            # Top decile picks
+            decile_size = max(1, len(ranked) // 10)
+            ranked.head(decile_size)[pick_cols].to_excel(writer, sheet_name='top_decile_picks', index=False)
+
+            # All predictions ranked
+            ranked[pick_cols].to_excel(writer, sheet_name='all_ranked', index=False)
+
+            # Prediction input: exact scaled feature values sent to the model
+            id_data = {}
+            for col in ['instrument_id', 'company_name', 'sector']:
+                if col in test_df.columns:
+                    id_data[col] = test_df[col].values
+            pred_input_df = pd.DataFrame(id_data, index=test_df.index)
+            for j, col in enumerate(available_cols):
+                pred_input_df[col] = X_test_scaled[:, j]
+            pred_input_df['score'] = proba
+            pred_input_df['predicted_outperform'] = predictions
+            pred_input_df.sort_values('score', ascending=False).to_excel(
+                writer, sheet_name='prediction_input', index=False
             )
 
         print(f"    Debug: {filepath}")
