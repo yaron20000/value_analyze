@@ -927,6 +927,28 @@ class MonthlyWalkForwardTrainer:
             }])
             pd.DataFrame(metrics_rows).to_excel(writer, sheet_name='summary_metrics', index=False)
 
+            # Year-by-year overview (Beat? based on OMXS30)
+            yby_rows = []
+            for r in yearly_results:
+                omxs30_val = r.get('index_returns', {}).get('OMXS30')
+                if omxs30_val is not None:
+                    beat = 'YES' if r['top_n_return'] > omxs30_val else 'no'
+                else:
+                    beat = 'N/A'
+                row = {
+                    'Year': r['year'],
+                    'Months': r['n_months'],
+                    'Benchmark': round(r['benchmark_return'], 2),
+                    f'Top {self.top_n}': round(r['top_n_return'], 2),
+                    'Decile': round(r['decile_return'], 2),
+                    'Beat? (vs OMXS30)': beat,
+                }
+                for ticker in NORDIC_INDEXES:
+                    val = r.get('index_returns', {}).get(ticker)
+                    row[ticker] = round(val, 2) if val is not None else None
+                yby_rows.append(row)
+            pd.DataFrame(yby_rows).to_excel(writer, sheet_name='year_by_year', index=False)
+
         print(f"\nSaved summary report: {filepath}")
 
     def _print_summary(self, yearly_results: list, monthly_results: list):
