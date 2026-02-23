@@ -994,19 +994,44 @@ class MLTransformer:
             WHERE close IS NOT NULL AND close > 0
             ORDER BY instrument_id, EXTRACT(YEAR FROM date), EXTRACT(MONTH FROM date), date DESC
         ),
+        latest_div AS (
+            -- For each (instrument, month_end), get the most recently published
+            -- dividend_per_share (annual report available before that month-end).
+            -- Monthly dividend income ≈ annual dividend / 12.
+            SELECT DISTINCT ON (me.instrument_id, me.year, me.month)
+                me.instrument_id,
+                me.year,
+                me.month,
+                f.dividend_per_share
+            FROM month_end_prices me
+            JOIN ml_features f
+                ON f.instrument_id = me.instrument_id AND f.period = 5
+            LEFT JOIN ml_pre_report_features pr
+                ON pr.instrument_id = f.instrument_id
+                AND pr.report_year   = f.year
+                AND pr.report_period = f.period
+            WHERE f.dividend_per_share > 0
+              AND COALESCE(pr.report_date, make_date(f.year + 1, 4, 1)) < me.month_end_date
+            ORDER BY me.instrument_id, me.year, me.month, f.year DESC
+        ),
         with_next AS (
             SELECT
                 me.*,
+                ld.dividend_per_share,
                 LEAD(month_end_price) OVER (
-                    PARTITION BY instrument_id ORDER BY year, month
+                    PARTITION BY me.instrument_id ORDER BY me.year, me.month
                 ) as next_month_price,
-                LEAD(year) OVER (
-                    PARTITION BY instrument_id ORDER BY year, month
+                LEAD(me.year) OVER (
+                    PARTITION BY me.instrument_id ORDER BY me.year, me.month
                 ) as next_year,
-                LEAD(month) OVER (
-                    PARTITION BY instrument_id ORDER BY year, month
+                LEAD(me.month) OVER (
+                    PARTITION BY me.instrument_id ORDER BY me.year, me.month
                 ) as next_month
             FROM month_end_prices me
+            LEFT JOIN latest_div ld
+                ON ld.instrument_id = me.instrument_id
+                AND ld.year = me.year
+                AND ld.month = me.month
         ),
         returns AS (
             SELECT
@@ -1015,7 +1040,20 @@ class MLTransformer:
                     -- Only calculate return if next month is actually the consecutive month
                     WHEN next_month_price IS NOT NULL
                         AND (year * 12 + month + 1) = (next_year * 12 + next_month)
-                    THEN ((next_month_price - month_end_price) / month_end_price) * 100
+                    THEN (
+                        -- Price return (%)
+                        ((next_month_price - month_end_price) / month_end_price) * 100
+                        -- Add monthly dividend income approximation:
+                        -- annual dividend_per_share / 12 months, as % of current price.
+                        -- This converts price-only return → total return so that
+                        -- high-yield stocks are not systematically undervalued in the label.
+                        + COALESCE(
+                            CASE WHEN dividend_per_share > 0 AND month_end_price > 0
+                                THEN (dividend_per_share / (12.0 * month_end_price)) * 100
+                            END,
+                            0.0
+                        )
+                    )
                 END as next_month_return
             FROM with_next
             WHERE 1=1 {where_clause}

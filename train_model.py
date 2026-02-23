@@ -124,7 +124,7 @@ class MonthlyWalkForwardTrainer:
             # Cash Flow (ratio)
             'fcf_margin', 'earnings_fcf',
             # Dividend
-            'dividend_payout',
+            'dividend_payout', 'dividend_growth',
         ]
 
         # Monthly price features (from ml_monthly_price_features)
@@ -150,7 +150,15 @@ class MonthlyWalkForwardTrainer:
             'insider_shares_to_total', 'buyback_shares_to_total',
         ]
 
-        self.feature_cols = self.fundamental_cols + self.price_cols + self.holdings_cols + self.normalized_cols
+        # Dividend yield history features (computed from multi-year fundamentals)
+        self.dividend_history_cols = [
+            'div_yield_2y_avg',   # average of current + prior year dividend yield
+            'div_yield_3y_avg',   # average of current + 2 prior years' dividend yield
+            'div_yield_trend',    # current yield minus prior year yield (+ = yield rising)
+        ]
+
+        self.feature_cols = (self.fundamental_cols + self.price_cols + self.holdings_cols
+                             + self.normalized_cols + self.dividend_history_cols)
 
         self.target_col = 'next_month_excess_return'
 
@@ -205,7 +213,7 @@ class MonthlyWalkForwardTrainer:
                 f.revenue_growth, f.earnings_growth,
                 f.ebit_growth, f.book_value_growth, f.assets_growth,
                 f.fcf_margin, f.earnings_fcf,
-                f.dividend_payout,
+                f.dividend_payout, f.dividend_growth,
                 -- Absolute metrics for normalization
                 f.market_cap, f.num_shares, f.total_assets, f.net_debt,
                 f.ocf, f.capex
@@ -251,6 +259,27 @@ class MonthlyWalkForwardTrainer:
             ORDER BY instrument_id, year
         """, self.conn)
         print(f"  Holdings: {len(df)} rows")
+        return df
+
+    def _add_dividend_history_features(self, fundamentals_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute trailing dividend yield features from the multi-year fundamentals DataFrame.
+
+        Each row in fundamentals_df is one annual report per instrument.  We shift within
+        each instrument to compute:
+          - div_yield_2y_avg: mean of current + prior-year dividend yield
+          - div_yield_3y_avg: mean of current + 2 prior years
+          - div_yield_trend:  current yield minus prior-year yield (positive = yield rising)
+        """
+        df = fundamentals_df.copy().sort_values(['instrument_id', 'report_year'])
+
+        prev1 = df.groupby('instrument_id')['dividend_yield'].shift(1)
+        prev2 = df.groupby('instrument_id')['dividend_yield'].shift(2)
+
+        df['div_yield_2y_avg'] = df[['dividend_yield']].assign(p1=prev1).mean(axis=1)
+        df['div_yield_3y_avg'] = df[['dividend_yield']].assign(p1=prev1, p2=prev2).mean(axis=1)
+        df['div_yield_trend']  = df['dividend_yield'] - prev1
+
         return df
 
     def _assemble_monthly_features(self, targets_df: pd.DataFrame,
@@ -381,6 +410,7 @@ class MonthlyWalkForwardTrainer:
         # Load all data
         targets_df = self._load_monthly_targets()
         fundamentals_df = self._load_fundamentals_with_dates()
+        fundamentals_df = self._add_dividend_history_features(fundamentals_df)
         price_features_df = self._load_monthly_price_features()
         holdings_df = self._load_holdings()
 
@@ -395,6 +425,19 @@ class MonthlyWalkForwardTrainer:
 
         # Filter to rows with valid target and fundamentals
         df_valid = df[df[self.target_col].notna() & df['report_date'].notna()].copy()
+
+        # Exclude index instruments (OMX indexes, Nordic indexes, sector indexes)
+        # These have instrument_type 2, 4, or 13 in the source API and are not stocks
+        index_name_pattern = r'^(OMX|OMXH|OMXS|OMXC|OBX|OSEBX|OB Oslo|First North)'
+        if 'company_name' in df_valid.columns:
+            is_index = df_valid['company_name'].str.match(index_name_pattern, case=False, na=False)
+            n_excluded = is_index.sum()
+            if n_excluded > 0:
+                excluded = df_valid.loc[is_index, 'company_name'].unique()
+                print(f"  Excluding {n_excluded} rows from {len(excluded)} index instrument(s): "
+                      f"{sorted(excluded)}")
+            df_valid = df_valid[~is_index]
+
         print(f"\nValid rows for training: {len(df_valid)}")
 
         # Create (year, month) index for walk-forward
