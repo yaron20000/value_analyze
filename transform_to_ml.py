@@ -101,7 +101,12 @@ class MLTransformer:
             61: 'num_shares',        # Number of Shares
             49: 'enterprise_value',  # Enterprise Value
             50: 'market_cap',        # Market Cap
-            63: 'fcf',              # Free Cash Flow (absolute)
+            63: 'fcf',               # Free Cash Flow (absolute)
+
+            # Asset quality
+            # KPI 126 = ImmateriellaTillgangar — total intangible assets incl. goodwill
+            # (Börsdata does not expose goodwill as a separate KPI)
+            126: 'intangible_assets',
         }
 
     def connect(self):
@@ -132,6 +137,8 @@ class MLTransformer:
             raw_data->'instruments' as instruments
         FROM api_raw_data
         WHERE endpoint_name = 'instruments'
+          AND success = true
+          AND raw_data IS NOT NULL
         ORDER BY fetch_timestamp DESC
         LIMIT 1
         """
@@ -221,6 +228,7 @@ class MLTransformer:
             dividend_payout,
             earnings, revenue, ebitda, total_assets, total_equity, net_debt, num_shares,
             enterprise_value, market_cap, fcf,
+            intangible_assets,
             fetch_date
         )
         SELECT
@@ -240,6 +248,7 @@ class MLTransformer:
             p.dividend_payout,
             p.earnings, p.revenue, p.ebitda, p.total_assets, p.total_equity, p.net_debt, p.num_shares,
             p.enterprise_value, p.market_cap, p.fcf,
+            p.intangible_assets,
             p.fetch_date
         FROM pivoted p
         ON CONFLICT (instrument_id, year, period) DO UPDATE SET
@@ -295,6 +304,7 @@ class MLTransformer:
             enterprise_value = EXCLUDED.enterprise_value,
             market_cap = EXCLUDED.market_cap,
             fcf = EXCLUDED.fcf,
+            intangible_assets = EXCLUDED.intangible_assets,
             fetch_date = EXCLUDED.fetch_date
         """
 
@@ -1223,7 +1233,8 @@ class MLTransformer:
     def run_migrations(self):
         """Run SQL migrations to ensure schema is up to date."""
         base_dir = os.path.dirname(__file__)
-        migrations = ['migration_gap_fix.sql', 'migration_monthly.sql']
+        migrations = ['migration_gap_fix.sql', 'migration_monthly.sql',
+                      'migration_add_asset_features.sql']
         for migration_file in migrations:
             migration_path = os.path.join(base_dir, migration_file)
             if not os.path.exists(migration_path):
@@ -1325,6 +1336,8 @@ def main():
     parser.add_argument('--db-password', default=os.getenv('DB_PASSWORD'))
     parser.add_argument('--db-port', type=int, default=int(os.getenv('DB_PORT', 5432)))
     parser.add_argument('--instrument-id', type=int, help='Transform specific instrument only')
+    parser.add_argument('--holdings-only', action='store_true',
+                        help='Only refresh ml_holdings_features (insider + buyback), skip full transform')
 
     args = parser.parse_args()
 
@@ -1341,7 +1354,16 @@ def main():
     }
 
     transformer = MLTransformer(db_config)
-    transformer.run(args.instrument_id)
+
+    if args.holdings_only:
+        try:
+            transformer.connect()
+            transformer.transform_holdings_data(args.instrument_id)
+            transformer.conn.commit()
+        finally:
+            transformer.close()
+    else:
+        transformer.run(args.instrument_id)
 
 
 if __name__ == '__main__':

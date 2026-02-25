@@ -157,8 +157,33 @@ class MonthlyWalkForwardTrainer:
             'div_yield_trend',    # current yield minus prior year yield (+ = yield rising)
         ]
 
+        # Long-term price behaviour features (computed from month_end_price history)
+        self.long_price_cols = [
+            'price_change_3m',    # 3-month return
+            'price_change_6m',    # 6-month return
+            'price_change_12m',   # 12-month return
+            'momentum_2_12m',     # months 2-12 momentum (excludes last month to avoid reversal)
+            'price_change_24m',   # 2-year return
+            'pct_from_52w_high',  # % below 52-week high
+            'pct_from_52w_low',   # % above 52-week low
+            'volatility_52w',     # 52-week return volatility
+        ]
+
+        # Asset quality features (computed from annual fundamentals)
+        # Requires: intangible_assets (KPI 126, incl. goodwill), total_equity in ml_features
+        # Note: Börsdata KPI 126 is total intangibles incl. goodwill (no separate goodwill KPI)
+        self.asset_cols = [
+            'intangibles_to_total_assets',  # intangible-heaviness of balance sheet
+            'price_to_tangible_book',       # market_cap / (equity - intangibles)
+            'intangibles_growth',           # YoY change in intangibles (capitalisation trend)
+        ]
+
+        # Size feature (log of current market cap = num_shares * month_end_price)
+        self.size_cols = ['log_market_cap']
+
         self.feature_cols = (self.fundamental_cols + self.price_cols + self.holdings_cols
-                             + self.normalized_cols + self.dividend_history_cols)
+                             + self.normalized_cols + self.dividend_history_cols
+                             + self.long_price_cols + self.asset_cols + self.size_cols)
 
         self.target_col = 'next_month_excess_return'
 
@@ -177,19 +202,19 @@ class MonthlyWalkForwardTrainer:
             self.conn.close()
 
     def _load_monthly_targets(self) -> pd.DataFrame:
-        """Load monthly targets (returns)."""
+        """Load monthly targets (returns). Includes latest partial month even if target not yet known."""
         print("Loading monthly targets...")
         df = pd.read_sql("""
             SELECT instrument_id, year, month, month_end_date, month_end_price,
                    next_month_return, market_median_monthly_return, next_month_excess_return
             FROM ml_monthly_targets
-            WHERE next_month_excess_return IS NOT NULL
             ORDER BY year, month, instrument_id
         """, self.conn)
-        print(f"  Monthly targets: {len(df)} rows, "
+        complete = df['next_month_excess_return'].notna().sum()
+        latest = df[['year', 'month']].drop_duplicates().sort_values(['year', 'month']).iloc[-1]
+        print(f"  Monthly targets: {len(df)} rows ({complete} with complete targets), "
               f"{df['instrument_id'].nunique()} instruments, "
-              f"{df['year'].min()}-{df['month'].iloc[0]:02d} to "
-              f"{df['year'].max()}-{df['month'].iloc[-1]:02d}")
+              f"latest month: {int(latest['year'])}-{int(latest['month']):02d}")
         return df
 
     def _load_fundamentals_with_dates(self) -> pd.DataFrame:
@@ -216,7 +241,9 @@ class MonthlyWalkForwardTrainer:
                 f.dividend_payout, f.dividend_growth,
                 -- Absolute metrics for normalization
                 f.market_cap, f.num_shares, f.total_assets, f.net_debt,
-                f.ocf, f.capex
+                f.ocf, f.capex,
+                -- Asset quality (KPI 126 = intangibles incl. goodwill; total_equity = KPI 58)
+                f.intangible_assets, f.total_equity
             FROM ml_features f
             LEFT JOIN ml_pre_report_features pr
                 ON f.instrument_id = pr.instrument_id
@@ -282,10 +309,85 @@ class MonthlyWalkForwardTrainer:
 
         return df
 
+    def _compute_long_term_price_features(self, targets_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute long-term price momentum and volatility features from month_end_price history.
+
+        All features are look-ahead safe: they use only prices up to and including
+        the current month-end, which is the prediction time.
+        """
+        df = targets_df[['instrument_id', 'year', 'month', 'month_end_price']].copy()
+        df = df.sort_values(['instrument_id', 'year', 'month']).reset_index(drop=True)
+
+        price = df.groupby('instrument_id')['month_end_price']
+
+        # Multi-month price changes
+        for n_months, col in [
+            (3,  'price_change_3m'),
+            (6,  'price_change_6m'),
+            (12, 'price_change_12m'),
+            (24, 'price_change_24m'),
+        ]:
+            df[col] = (df['month_end_price'] / price.shift(n_months) - 1) * 100
+
+        # Momentum months 2-12: skip most recent month to avoid short-term reversal
+        df['momentum_2_12m'] = (price.shift(1) / price.shift(12) - 1) * 100
+
+        # 52-week high/low proximity
+        rolling_high = price.transform(lambda x: x.rolling(12, min_periods=6).max())
+        rolling_low  = price.transform(lambda x: x.rolling(12, min_periods=6).min())
+        df['pct_from_52w_high'] = (df['month_end_price'] / rolling_high - 1) * 100
+        df['pct_from_52w_low']  = (df['month_end_price'] / rolling_low  - 1) * 100
+
+        # 52-week return volatility (std of monthly returns)
+        monthly_ret = price.pct_change()
+        df['volatility_52w'] = monthly_ret.transform(
+            lambda x: x.rolling(12, min_periods=6).std()
+        ) * 100
+
+        result_cols = ['instrument_id', 'year', 'month'] + self.long_price_cols
+        available = [c for c in result_cols if c in df.columns]
+        print(f"  Long-term price features: {len(df)} rows, "
+              f"{len(available) - 3} features computed")
+        return df[available]
+
+    def _add_asset_ratio_features(self, fundamentals_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute tangible/intangible asset features from annual fundamentals.
+
+        Requires intangible_assets, goodwill, total_equity columns in ml_features.
+        Features are computed per-instrument per-year; look-ahead is prevented via
+        the same report_date join used for all fundamentals.
+        """
+        df = fundamentals_df.copy().sort_values(['instrument_id', 'report_year'])
+
+        for col in ['total_assets', 'total_equity']:
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+        ta = df['total_assets'].replace(0, np.nan)
+
+        if 'intangible_assets' in df.columns:
+            df['intangible_assets'] = df['intangible_assets'].astype(float)
+            df['intangibles_to_total_assets'] = df['intangible_assets'] / ta
+
+            prev_intangibles = df.groupby('instrument_id')['intangible_assets'].shift(1)
+            df['intangibles_growth'] = (
+                (df['intangible_assets'] - prev_intangibles)
+                / prev_intangibles.abs().replace(0, np.nan) * 100
+            )
+
+            # Tangible book = equity minus all intangibles (KPI 126 includes goodwill)
+            if 'total_equity' in df.columns:
+                tangible_book = df['total_equity'] - df['intangible_assets'].fillna(0)
+                df['price_to_tangible_book'] = df['market_cap'] / tangible_book.replace(0, np.nan)
+
+        return df
+
     def _assemble_monthly_features(self, targets_df: pd.DataFrame,
                                     fundamentals_df: pd.DataFrame,
                                     price_features_df: pd.DataFrame,
-                                    holdings_df: pd.DataFrame) -> pd.DataFrame:
+                                    holdings_df: pd.DataFrame,
+                                    long_price_features_df: pd.DataFrame) -> pd.DataFrame:
         """
         Assemble the full feature matrix for all (stock, month) pairs.
 
@@ -340,8 +442,21 @@ class MonthlyWalkForwardTrainer:
         if 'holdings_for_year' in merged.columns:
             merged.drop(columns=['holdings_for_year'], inplace=True)
 
+        # --- Join long-term price features ---
+        merged = merged.merge(
+            long_price_features_df,
+            on=['instrument_id', 'year', 'month'],
+            how='left'
+        )
+
         # Create normalized features
         merged = self._create_normalized_features(merged)
+
+        # Log market cap: use current num_shares * month_end_price (more accurate than stale annual)
+        if 'num_shares' in merged.columns and 'month_end_price' in merged.columns:
+            merged['log_market_cap'] = np.log1p(
+                merged['num_shares'] * merged['month_end_price']
+            )
 
         print(f"  Assembled: {len(merged)} rows, {merged['instrument_id'].nunique()} instruments")
         n_with_fundamentals = merged['report_date'].notna().sum()
@@ -404,19 +519,141 @@ class MonthlyWalkForwardTrainer:
 
         return X_train_scaled, X_test_scaled, y_train, y_test, available_cols, train_medians
 
-    def run_walk_forward(self):
-        """Run the full monthly walk-forward expanding-window backtest."""
+    def _predict_current_month(self, train_df: pd.DataFrame, current_df: pd.DataFrame,
+                               output_dir: str):
+        """
+        Train on all complete historical months and predict on the current (partial) month.
+
+        Produces a ranked list of stocks by outperformance probability and saves to Excel.
+        No target variable is available — this is a live forward-looking prediction.
+        """
+        year = int(current_df['year'].iloc[0])
+        month = int(current_df['month'].iloc[0])
+        latest_date = (current_df['month_end_date'].max()
+                       if 'month_end_date' in current_df.columns else 'N/A')
+
+        print(f"\n{'='*60}")
+        print(f"CURRENT MONTH PREDICTION: {year}-{month:02d}  (data as of {latest_date})")
+        print(f"  Training on {len(train_df)} rows from all complete months")
+        print(f"  Predicting for {len(current_df)} stocks")
+
+        available_cols = [c for c in self.feature_cols if c in train_df.columns]
+
+        X_train = train_df[available_cols].copy()
+        X_current = current_df[available_cols].copy()
+        y_train = (train_df[self.target_col] > 0).astype(int)
+
+        train_medians = X_train.median()
+        X_train = X_train.fillna(train_medians)
+        X_current = X_current.fillna(train_medians)
+
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_current_scaled = scaler.transform(X_current)
+
+        model = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=8,
+            min_samples_split=10,
+            min_samples_leaf=10,
+            random_state=42,
+            n_jobs=-1
+        )
+        model.fit(X_train_scaled, y_train)
+
+        proba = model.predict_proba(X_current_scaled)[:, 1]
+        ranked = current_df.copy()
+        ranked['score'] = proba
+        ranked = ranked.sort_values('score', ascending=False).reset_index(drop=True)
+        ranked['rank'] = range(1, len(ranked) + 1)
+
+        feature_importance = pd.DataFrame({
+            'feature': available_cols,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+        # Save to Excel
+        filepath = os.path.join(output_dir, f'current_month_{year}_{month:02d}_predictions.xlsx')
+        pick_cols = [c for c in ['rank', 'instrument_id', 'company_name', 'sector', 'market',
+                                  'score', 'month_end_date', 'month_end_price',
+                                  'report_date', 'report_year'] if c in ranked.columns]
+        decile_size = max(1, len(ranked) // 10)
+
+        with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+            ranked[pick_cols].to_excel(writer, sheet_name='all_ranked', index=False)
+            ranked.head(self.top_n)[pick_cols].to_excel(
+                writer, sheet_name=f'top_{self.top_n}_picks', index=False)
+            ranked.head(decile_size)[pick_cols].to_excel(
+                writer, sheet_name='top_decile_picks', index=False)
+            feature_importance.head(30).to_excel(
+                writer, sheet_name='feature_importance', index=False)
+
+            # Prediction input: scaled feature values for transparency
+            id_data = {col: current_df[col].values
+                       for col in ['instrument_id', 'company_name', 'sector']
+                       if col in current_df.columns}
+            pred_input_df = pd.DataFrame(id_data, index=current_df.index)
+            for j, col in enumerate(available_cols):
+                pred_input_df[col] = X_current_scaled[:, j]
+            pred_input_df['score'] = proba
+            pred_input_df.sort_values('score', ascending=False).to_excel(
+                writer, sheet_name='prediction_input', index=False)
+
+            # Model info
+            pd.DataFrame([
+                {'metric': 'Prediction month', 'value': f'{year}-{month:02d}'},
+                {'metric': 'Data as of (latest price date)', 'value': str(latest_date)},
+                {'metric': 'N stocks predicted', 'value': len(ranked)},
+                {'metric': 'Training samples (complete months)', 'value': len(train_df)},
+                {'metric': 'Features used', 'value': len(available_cols)},
+                {'metric': f'Top {self.top_n} size', 'value': self.top_n},
+                {'metric': 'Top decile size', 'value': decile_size},
+            ]).to_excel(writer, sheet_name='model_info', index=False)
+
+        print(f"\n  Top {self.top_n} picks for {year}-{month:02d}:")
+        for _, row in ranked.head(self.top_n).iterrows():
+            name = str(row.get('company_name', row['instrument_id']))
+            sector = str(row.get('sector', 'N/A'))
+            print(f"    #{int(row['rank']):2d}  {name:<35s}  {sector:<25s}  score={row['score']:.3f}")
+        print(f"\n  Saved: {filepath}")
+        print(f"{'='*60}")
+
+    def _save_prediction_timestamp(self, year: int, month: int):
+        """Save a timestamp file recording when the last prediction was run."""
+        import json as _json
+        filepath = os.path.join(self.output_dir, 'last_prediction.json')
+        data = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'year': year,
+            'month': month,
+        }
+        os.makedirs(self.output_dir, exist_ok=True)
+        with open(filepath, 'w') as f:
+            _json.dump(data, f, indent=2)
+        print(f"  Prediction timestamp saved: {filepath}")
+
+    def run_walk_forward(self, predict_only: bool = False):
+        """Run the full monthly walk-forward expanding-window backtest.
+
+        If predict_only=True, skip the backtest loop and only run the
+        current-month prediction using all complete months as training data.
+        """
 
         # Load all data
         targets_df = self._load_monthly_targets()
         fundamentals_df = self._load_fundamentals_with_dates()
         fundamentals_df = self._add_dividend_history_features(fundamentals_df)
+        fundamentals_df = self._add_asset_ratio_features(fundamentals_df)
         price_features_df = self._load_monthly_price_features()
         holdings_df = self._load_holdings()
 
+        # Compute long-term price features from full price history (before any filtering)
+        print("Computing long-term price features...")
+        long_price_features_df = self._compute_long_term_price_features(targets_df)
+
         # Assemble full feature matrix
         df = self._assemble_monthly_features(
-            targets_df, fundamentals_df, price_features_df, holdings_df
+            targets_df, fundamentals_df, price_features_df, holdings_df, long_price_features_df
         )
 
         # Fetch Nordic index returns from Avanza
@@ -425,6 +662,9 @@ class MonthlyWalkForwardTrainer:
 
         # Filter to rows with valid target and fundamentals
         df_valid = df[df[self.target_col].notna() & df['report_date'].notna()].copy()
+
+        # Rows with no target yet — candidate for current-month live prediction
+        df_current_candidates = df[df[self.target_col].isna() & df['report_date'].notna()].copy()
 
         # Exclude index instruments (OMX indexes, Nordic indexes, sector indexes)
         # These have instrument_type 2, 4, or 13 in the source API and are not stocks
@@ -437,6 +677,25 @@ class MonthlyWalkForwardTrainer:
                 print(f"  Excluding {n_excluded} rows from {len(excluded)} index instrument(s): "
                       f"{sorted(excluded)}")
             df_valid = df_valid[~is_index]
+        if 'company_name' in df_current_candidates.columns:
+            is_index_cur = df_current_candidates['company_name'].str.match(
+                index_name_pattern, case=False, na=False)
+            df_current_candidates = df_current_candidates[~is_index_cur]
+
+        # Keep only the single latest (year, month) as the current-month prediction target
+        df_current = pd.DataFrame()
+        if len(df_current_candidates) > 0:
+            latest_ym = (df_current_candidates[['year', 'month']]
+                         .drop_duplicates()
+                         .sort_values(['year', 'month'])
+                         .iloc[-1])
+            df_current = df_current_candidates[
+                (df_current_candidates['year'] == latest_ym['year']) &
+                (df_current_candidates['month'] == latest_ym['month'])
+            ].copy()
+            print(f"  Current (partial) month for live prediction: "
+                  f"{int(latest_ym['year'])}-{int(latest_ym['month']):02d} "
+                  f"({len(df_current)} stocks)")
 
         print(f"\nValid rows for training: {len(df_valid)}")
 
@@ -453,6 +712,17 @@ class MonthlyWalkForwardTrainer:
         reports_dir = os.path.join(self.output_dir, 'reports')
         os.makedirs(debug_dir, exist_ok=True)
         os.makedirs(reports_dir, exist_ok=True)
+
+        # --predict-only: skip backtest, jump straight to current-month prediction
+        if predict_only:
+            print("\n[predict-only mode] Skipping backtest walk-forward.")
+            if len(df_current) > 0:
+                self._predict_current_month(df_valid, df_current, reports_dir)
+                latest_ym = df_current[['year', 'month']].iloc[0]
+                self._save_prediction_timestamp(int(latest_ym['year']), int(latest_ym['month']))
+            else:
+                print("  No current-month data available for prediction.")
+            return
 
         all_monthly_results = []
 
@@ -584,6 +854,12 @@ class MonthlyWalkForwardTrainer:
 
         # Print summary
         self._print_summary(yearly_results, all_monthly_results)
+
+        # Predict on the current (possibly incomplete) month using all historical data
+        if len(df_current) > 0:
+            self._predict_current_month(df_valid, df_current, reports_dir)
+            latest_ym = df_current[['year', 'month']].iloc[0]
+            self._save_prediction_timestamp(int(latest_ym['year']), int(latest_ym['month']))
 
     def _save_debug_excel(self, debug_dir: str, year: int, month: int,
                           train_df: pd.DataFrame, test_df: pd.DataFrame,
@@ -1042,6 +1318,8 @@ def main():
                         help='Number of top stocks to pick each month (default: 20)')
     parser.add_argument('--output-dir', default='results',
                         help='Output directory for debug and report files (default: results)')
+    parser.add_argument('--predict-only', action='store_true',
+                        help='Skip backtest, only run current-month prediction using all history as training data')
 
     args = parser.parse_args()
 
@@ -1066,7 +1344,7 @@ def main():
 
     try:
         trainer.connect()
-        trainer.run_walk_forward()
+        trainer.run_walk_forward(predict_only=args.predict_only)
     finally:
         trainer.close()
 
