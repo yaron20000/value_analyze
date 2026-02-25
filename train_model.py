@@ -583,6 +583,8 @@ class MonthlyWalkForwardTrainer:
             ranked[pick_cols].to_excel(writer, sheet_name='all_ranked', index=False)
             ranked.head(self.top_n)[pick_cols].to_excel(
                 writer, sheet_name=f'top_{self.top_n}_picks', index=False)
+            ranked.head(30)[pick_cols].to_excel(
+                writer, sheet_name='top_30_picks', index=False)
             ranked.head(decile_size)[pick_cols].to_excel(
                 writer, sheet_name='top_decile_picks', index=False)
             feature_importance.head(30).to_excel(
@@ -783,6 +785,7 @@ class MonthlyWalkForwardTrainer:
             ranked['rank'] = range(1, len(ranked) + 1)
 
             top_n_picks = ranked.head(self.top_n).copy()
+            top_30_picks = ranked.head(30).copy()
             decile_size = max(1, len(ranked) // 10)
             top_decile_picks = ranked.head(decile_size).copy()
 
@@ -790,6 +793,8 @@ class MonthlyWalkForwardTrainer:
             benchmark_return = test_df['market_median_monthly_return'].iloc[0]
             top_n_return = top_n_picks['next_month_return'].mean()
             top_n_excess = top_n_picks[self.target_col].mean()
+            top_30_return = top_30_picks['next_month_return'].mean()
+            top_30_excess = top_30_picks[self.target_col].mean()
             decile_return = top_decile_picks['next_month_return'].mean()
             decile_excess = top_decile_picks[self.target_col].mean()
 
@@ -801,7 +806,7 @@ class MonthlyWalkForwardTrainer:
             idx_str = ''.join(
                 f" {t}={r:+.1f}%" for t, r in month_index_returns.items() if r is not None
             )
-            print(f" | Top{self.top_n}={top_n_return:+.2f}% Bench={benchmark_return:+.2f}%{idx_str}")
+            print(f" | Top{self.top_n}={top_n_return:+.2f}% Top30={top_30_return:+.2f}% Bench={benchmark_return:+.2f}%{idx_str}")
 
             # Feature importance
             feature_importance = pd.DataFrame({
@@ -823,12 +828,15 @@ class MonthlyWalkForwardTrainer:
                 'benchmark_return': benchmark_return,
                 'top_n_return': top_n_return,
                 'top_n_excess': top_n_excess,
+                'top_30_return': top_30_return,
+                'top_30_excess': top_30_excess,
                 'decile_return': decile_return,
                 'decile_excess': decile_excess,
                 'decile_size': decile_size,
                 'index_returns': month_index_returns,
                 'feature_importance': feature_importance,
                 'top_n_picks': top_n_picks,
+                'top_30_picks': top_30_picks,
                 'top_decile_picks': top_decile_picks,
             }
             all_monthly_results.append(monthly_result)
@@ -896,6 +904,9 @@ class MonthlyWalkForwardTrainer:
                                       'next_month_return', 'market_median_monthly_return'] if c in ranked.columns]
             ranked.head(self.top_n)[pick_cols].to_excel(writer, sheet_name='top_n_picks', index=False)
 
+            # Top 30 picks
+            ranked.head(30)[pick_cols].to_excel(writer, sheet_name='top_30_picks', index=False)
+
             # Top decile picks
             decile_size = max(1, len(ranked) // 10)
             ranked.head(decile_size)[pick_cols].to_excel(writer, sheet_name='top_decile_picks', index=False)
@@ -930,6 +941,7 @@ class MonthlyWalkForwardTrainer:
                     'months': [],
                     'benchmark_monthly': [],
                     'top_n_monthly': [],
+                    'top_30_monthly': [],
                     'decile_monthly': [],
                     'index_monthly': {t: [] for t in NORDIC_INDEXES},
                     'accuracies': [],
@@ -942,11 +954,13 @@ class MonthlyWalkForwardTrainer:
                     'decile_sizes': [],
                     'feature_importances': [],
                     'all_top_n_picks': [],
+                    'all_top_30_picks': [],
                     'all_decile_picks': [],
                 }
             yearly[y]['months'].append(mr['month'])
             yearly[y]['benchmark_monthly'].append(mr['benchmark_return'])
             yearly[y]['top_n_monthly'].append(mr['top_n_return'])
+            yearly[y]['top_30_monthly'].append(mr['top_30_return'])
             yearly[y]['decile_monthly'].append(mr['decile_return'])
             for ticker in NORDIC_INDEXES:
                 val = mr.get('index_returns', {}).get(ticker)
@@ -961,6 +975,7 @@ class MonthlyWalkForwardTrainer:
             yearly[y]['decile_sizes'].append(mr['decile_size'])
             yearly[y]['feature_importances'].append(mr['feature_importance'])
             yearly[y]['all_top_n_picks'].append(mr['top_n_picks'])
+            yearly[y]['all_top_30_picks'].append(mr['top_30_picks'])
             yearly[y]['all_decile_picks'].append(mr['top_decile_picks'])
 
         # Compound monthly returns for each year
@@ -970,6 +985,7 @@ class MonthlyWalkForwardTrainer:
             # Compound: product of (1 + r/100) - 1, times 100
             benchmark_compound = (np.prod([1 + r/100 for r in yd['benchmark_monthly']]) - 1) * 100
             top_n_compound = (np.prod([1 + r/100 for r in yd['top_n_monthly']]) - 1) * 100
+            top_30_compound = (np.prod([1 + r/100 for r in yd['top_30_monthly']]) - 1) * 100
             decile_compound = (np.prod([1 + r/100 for r in yd['decile_monthly']]) - 1) * 100
 
             # Compound index returns (skip months with missing data)
@@ -1000,6 +1016,8 @@ class MonthlyWalkForwardTrainer:
                 'benchmark_return': benchmark_compound,
                 'top_n_return': top_n_compound,
                 'top_n_excess': top_n_compound - benchmark_compound,
+                'top_30_return': top_30_compound,
+                'top_30_excess': top_30_compound - benchmark_compound,
                 'decile_return': decile_compound,
                 'decile_excess': decile_compound - benchmark_compound,
                 'decile_size_avg': int(np.mean(yd['decile_sizes'])),
@@ -1008,8 +1026,10 @@ class MonthlyWalkForwardTrainer:
                 'feature_importance': avg_fi,
                 'monthly_benchmark': yd['benchmark_monthly'],
                 'monthly_top_n': yd['top_n_monthly'],
+                'monthly_top_30': yd['top_30_monthly'],
                 'monthly_decile': yd['decile_monthly'],
                 'all_top_n_picks': yd['all_top_n_picks'],
+                'all_top_30_picks': yd['all_top_30_picks'],
                 'all_decile_picks': yd['all_decile_picks'],
             })
 
@@ -1035,6 +1055,8 @@ class MonthlyWalkForwardTrainer:
                     'benchmark_return_compounded': round(yr['benchmark_return'], 2),
                     f'top_{self.top_n}_return_compounded': round(yr['top_n_return'], 2),
                     f'top_{self.top_n}_excess': round(yr['top_n_excess'], 2),
+                    'top_30_return_compounded': round(yr['top_30_return'], 2),
+                    'top_30_excess': round(yr['top_30_excess'], 2),
                     'decile_return_compounded': round(yr['decile_return'], 2),
                     'decile_excess': round(yr['decile_excess'], 2),
                 }
@@ -1049,6 +1071,7 @@ class MonthlyWalkForwardTrainer:
                     'month': yr['months'],
                     'benchmark_return': [round(r, 2) for r in yr['monthly_benchmark']],
                     f'top_{self.top_n}_return': [round(r, 2) for r in yr['monthly_top_n']],
+                    'top_30_return': [round(r, 2) for r in yr['monthly_top_30']],
                     'decile_return': [round(r, 2) for r in yr['monthly_decile']],
                 }
                 for ticker in NORDIC_INDEXES:
@@ -1089,6 +1112,8 @@ class MonthlyWalkForwardTrainer:
                     'benchmark_return': round(r['benchmark_return'], 2),
                     f'top_{self.top_n}_return': round(r['top_n_return'], 2),
                     f'top_{self.top_n}_excess': round(r['top_n_excess'], 2),
+                    'top_30_return': round(r['top_30_return'], 2),
+                    'top_30_excess': round(r['top_30_excess'], 2),
                     'decile_return': round(r['decile_return'], 2),
                     'decile_excess': round(r['decile_excess'], 2),
                     'decile_size_avg': r['decile_size_avg'],
@@ -1103,6 +1128,7 @@ class MonthlyWalkForwardTrainer:
             # Cumulative performance (invest 100 at start)
             benchmark_cum = 100.0
             top_n_cum = 100.0
+            top_30_cum = 100.0
             decile_cum = 100.0
             index_cum = {t: 100.0 for t in NORDIC_INDEXES}
             cum_rows = []
@@ -1110,11 +1136,13 @@ class MonthlyWalkForwardTrainer:
             for r in yearly_results:
                 benchmark_cum *= (1 + r['benchmark_return'] / 100)
                 top_n_cum *= (1 + r['top_n_return'] / 100)
+                top_30_cum *= (1 + r['top_30_return'] / 100)
                 decile_cum *= (1 + r['decile_return'] / 100)
                 row = {
                     'year': r['year'],
                     'benchmark_cumulative': round(benchmark_cum, 2),
                     f'top_{self.top_n}_cumulative': round(top_n_cum, 2),
+                    'top_30_cumulative': round(top_30_cum, 2),
                     'decile_cumulative': round(decile_cum, 2),
                 }
                 for ticker in NORDIC_INDEXES:
@@ -1136,6 +1164,7 @@ class MonthlyWalkForwardTrainer:
                     'auc': round(r['auc'], 3),
                     'benchmark': round(r['benchmark_return'], 2),
                     f'top_{self.top_n}': round(r['top_n_return'], 2),
+                    'top_30': round(r['top_30_return'], 2),
                     'decile': round(r['decile_return'], 2),
                 }
                 for ticker in NORDIC_INDEXES:
@@ -1171,6 +1200,12 @@ class MonthlyWalkForwardTrainer:
                 'metric': f'Avg Top {self.top_n} Annual Excess',
                 'value': round(yearly_df[f'top_{self.top_n}_excess'].mean(), 2),
             }, {
+                'metric': 'Avg Top 30 Annual Return',
+                'value': round(yearly_df['top_30_return'].mean(), 2),
+            }, {
+                'metric': 'Avg Top 30 Annual Excess',
+                'value': round(yearly_df['top_30_excess'].mean(), 2),
+            }, {
                 'metric': 'Avg Decile Annual Return',
                 'value': round(yearly_df['decile_return'].mean(), 2),
             }, {
@@ -1182,6 +1217,9 @@ class MonthlyWalkForwardTrainer:
             }, {
                 'metric': f'Final Cumulative - Top {self.top_n}',
                 'value': cum_rows[-1][f'top_{self.top_n}_cumulative'] if cum_rows else 0,
+            }, {
+                'metric': 'Final Cumulative - Top 30',
+                'value': cum_rows[-1]['top_30_cumulative'] if cum_rows else 0,
             }, {
                 'metric': 'Final Cumulative - Decile',
                 'value': cum_rows[-1]['decile_cumulative'] if cum_rows else 0,
@@ -1216,6 +1254,7 @@ class MonthlyWalkForwardTrainer:
                     'Months': r['n_months'],
                     'Benchmark': round(r['benchmark_return'], 2),
                     f'Top {self.top_n}': round(r['top_n_return'], 2),
+                    'Top 30': round(r['top_30_return'], 2),
                     'Decile': round(r['decile_return'], 2),
                     'Beat? (vs OMXS30)': beat,
                 }
@@ -1239,6 +1278,7 @@ class MonthlyWalkForwardTrainer:
         avg_accuracy = np.mean([r['accuracy'] for r in yearly_results])
         avg_benchmark = np.mean([r['benchmark_return'] for r in yearly_results])
         avg_top_n = np.mean([r['top_n_return'] for r in yearly_results])
+        avg_top_30 = np.mean([r['top_30_return'] for r in yearly_results])
         avg_decile = np.mean([r['decile_return'] for r in yearly_results])
 
         print(f"\nModel Quality (avg across years):")
@@ -1248,6 +1288,7 @@ class MonthlyWalkForwardTrainer:
         print(f"\nPortfolio Performance (avg compounded annual return):")
         print(f"  Benchmark (market median):  {avg_benchmark:+.2f}%")
         print(f"  Top {self.top_n} portfolio:         {avg_top_n:+.2f}%")
+        print(f"  Top 30 portfolio:           {avg_top_30:+.2f}%")
         print(f"  Top decile portfolio:       {avg_decile:+.2f}%")
 
         # Avg index returns
@@ -1260,11 +1301,13 @@ class MonthlyWalkForwardTrainer:
         # Cumulative
         benchmark_cum = 100.0
         top_n_cum = 100.0
+        top_30_cum = 100.0
         decile_cum = 100.0
         index_cum = {t: 100.0 for t in NORDIC_INDEXES}
         for r in yearly_results:
             benchmark_cum *= (1 + r['benchmark_return'] / 100)
             top_n_cum *= (1 + r['top_n_return'] / 100)
+            top_30_cum *= (1 + r['top_30_return'] / 100)
             decile_cum *= (1 + r['decile_return'] / 100)
             for ticker in NORDIC_INDEXES:
                 val = r.get('index_returns', {}).get(ticker)
@@ -1274,6 +1317,7 @@ class MonthlyWalkForwardTrainer:
         print(f"\nCumulative Growth (100 invested at start):")
         print(f"  Benchmark:         {benchmark_cum:.2f}")
         print(f"  Top {self.top_n} portfolio:  {top_n_cum:.2f}")
+        print(f"  Top 30 portfolio:  {top_30_cum:.2f}")
         print(f"  Top decile:        {decile_cum:.2f}")
         for ticker, info in NORDIC_INDEXES.items():
             print(f"  {ticker:17s}  {index_cum[ticker]:.2f}")
@@ -1288,8 +1332,8 @@ class MonthlyWalkForwardTrainer:
         idx_sep = '-' * (8 * len(idx_tickers) + len(idx_tickers))
 
         print(f"\nYear-by-year (compounded monthly returns):")
-        print(f"  {'Year':<6} {'Months':>6} {'Benchmark':>10} {'Top '+str(self.top_n):>10} {'Decile':>10} {'Beat?':>6}{idx_header}")
-        print(f"  {'-'*50}{idx_sep}")
+        print(f"  {'Year':<6} {'Months':>6} {'Benchmark':>10} {'Top '+str(self.top_n):>10} {'Top 30':>10} {'Decile':>10} {'Beat?':>6}{idx_header}")
+        print(f"  {'-'*60}{idx_sep}")
         for r in yearly_results:
             beat = 'YES' if r['top_n_return'] > r['benchmark_return'] else 'no'
             idx_vals = ''
@@ -1297,7 +1341,7 @@ class MonthlyWalkForwardTrainer:
                 v = r.get('index_returns', {}).get(t)
                 idx_vals += f' {v:>+7.1f}%' if v is not None else f' {"N/A":>8}'
             print(f"  {r['year']:<6} {r['n_months']:>6} {r['benchmark_return']:>+9.2f}% "
-                  f"{r['top_n_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}{idx_vals}")
+                  f"{r['top_n_return']:>+9.2f}% {r['top_30_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}{idx_vals}")
 
         print(f"\nOutputs saved to: {os.path.abspath(self.output_dir)}/")
         print(f"  debug/   - Model inputs + outputs per month")
