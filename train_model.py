@@ -98,12 +98,17 @@ class MonthlyWalkForwardTrainer:
     """Monthly walk-forward expanding-window classifier for outperformance prediction."""
 
     def __init__(self, db_config: dict, output_dir: str = 'results',
-                 min_train_months: int = 36, top_n: int = 20):
+                 min_train_months: int = 36, top_n: int = 20,
+                 initial_capital: float = 100_000, commission_rate: float = 0.0015,
+                 max_stale_days: int = 10):
         self.db_config = db_config
         self.conn = None
         self.output_dir = output_dir
         self.min_train_months = min_train_months
         self.top_n = top_n
+        self.initial_capital = initial_capital
+        self.commission_rate = commission_rate
+        self.max_stale_days = max_stale_days
         self.index_returns = {}  # populated before walk-forward
 
         # Fundamental feature columns (from annual reports)
@@ -699,6 +704,26 @@ class MonthlyWalkForwardTrainer:
                   f"{int(latest_ym['year'])}-{int(latest_ym['month']):02d} "
                   f"({len(df_current)} stocks)")
 
+            # --- Filter out stocks with stale price data ---
+            # Companies that haven't traded recently (e.g. suspended/delisted) would
+            # have an old month_end_date while active stocks have prices up to yesterday.
+            # Drop any stock whose last price is more than max_stale_days behind the
+            # freshest price in the current-month batch.
+            if 'month_end_date' in df_current.columns and len(df_current) > 0:
+                dates = pd.to_datetime(df_current['month_end_date'], errors='coerce')
+                freshest = dates.max()
+                stale_cutoff = freshest - pd.Timedelta(days=self.max_stale_days)
+                is_stale = dates < stale_cutoff
+                n_stale = int(is_stale.sum())
+                if n_stale > 0:
+                    stale_names = df_current.loc[is_stale, 'company_name'].tolist() \
+                        if 'company_name' in df_current.columns else []
+                    preview = stale_names[:8]
+                    ellipsis = '...' if n_stale > 8 else ''
+                    print(f"  Excluding {n_stale} stale stock(s) (last price >{self.max_stale_days}d "
+                          f"before {freshest.date()}): {preview}{ellipsis}")
+                    df_current = df_current[~is_stale].copy()
+
         print(f"\nValid rows for training: {len(df_valid)}")
 
         # Create (year, month) index for walk-forward
@@ -860,6 +885,18 @@ class MonthlyWalkForwardTrainer:
         self._save_yearly_reports(reports_dir, yearly_results)
         self._save_summary_report(reports_dir, yearly_results, all_monthly_results)
 
+        # Account simulation
+        print("\nSimulating trading account...")
+        tx_df, period_df = self._simulate_account(
+            all_monthly_results,
+            initial_capital=self.initial_capital,
+            commission_rate=self.commission_rate,
+        )
+        self._save_account_report(
+            reports_dir, tx_df, period_df,
+            self.initial_capital, self.commission_rate,
+        )
+
         # Print summary
         self._print_summary(yearly_results, all_monthly_results)
 
@@ -868,6 +905,297 @@ class MonthlyWalkForwardTrainer:
             self._predict_current_month(df_valid, df_current, reports_dir)
             latest_ym = df_current[['year', 'month']].iloc[0]
             self._save_prediction_timestamp(int(latest_ym['year']), int(latest_ym['month']))
+
+    def _simulate_account(self, monthly_results: list,
+                          initial_capital: float = 100_000,
+                          commission_rate: float = 0.0015) -> tuple:
+        """
+        Simulate a trading account following the model's top-N picks.
+
+        Logic:
+          - Each month SELL all stocks that left the top-N list.
+          - BUY all stocks newly entering the list, splitting sell proceeds equally.
+          - Staying stocks are left untouched (their value drifts with returns).
+          - Commission (commission_rate) is charged on every individual buy/sell.
+
+        Sell price for leaving stocks is estimated as:
+            previous_month_end_price × (1 + next_month_return / 100)
+
+        A parallel OMXS30 buy-and-hold account (same initial capital, same initial
+        buy commission) is simulated over the identical holding periods (month T+1
+        for picks made at end of month T).
+
+        Returns:
+            (transactions_df, period_summary_df)
+        """
+        omxs30_monthly = self.index_returns.get('OMXS30', {})
+
+        model_value: float = initial_capital
+        omxs30_value: float = initial_capital * (1 - commission_rate)
+
+        current_shares: dict = {}   # {iid: shares held}
+        current_prices: dict = {}   # {iid: price last used for this position}
+        prev_price_map: dict = {}   # price_map from the previous period
+        prev_return_map: dict = {}  # return_map from the previous period
+        all_names: dict = {}        # cumulative {iid: company_name} across all periods
+
+        tx_rows: list = []
+        period_rows: list = []
+
+        for i, mr in enumerate(monthly_results):
+            year, month = int(mr['year']), int(mr['month'])
+            picks_df = mr['top_n_picks'].copy()
+            if len(picks_df) == 0:
+                continue
+
+            new_ids_set = set(picks_df['instrument_id'].tolist())
+            old_ids_set = set(current_shares.keys())
+            period_str = f'{year}-{month:02d}'
+
+            # ---- build lookup maps for this period ----
+            price_map: dict = {}
+            if 'month_end_price' in picks_df.columns:
+                for _, row in picks_df.iterrows():
+                    p = row.get('month_end_price')
+                    if pd.notna(p) and float(p) > 0:
+                        price_map[row['instrument_id']] = float(p)
+
+            if 'company_name' in picks_df.columns:
+                all_names.update(zip(picks_df['instrument_id'], picks_df['company_name']))
+
+            return_map = dict(zip(
+                picks_df['instrument_id'],
+                picks_df['next_month_return'].fillna(0)
+            ))
+
+            leaving  = old_ids_set - new_ids_set
+            entering = new_ids_set - old_ids_set
+            period_commission = 0.0
+            period_tx: list = []
+
+            def _name(iid):
+                return all_names.get(iid, str(iid))
+
+            # ============================================================
+            # INITIAL PURCHASE (period 0)
+            # ============================================================
+            if i == 0:
+                init_commission = model_value * commission_rate
+                period_commission = init_commission
+                model_value -= init_commission
+                target_per_stock = model_value / max(len(new_ids_set), 1)
+
+                for iid in sorted(new_ids_set, key=_name):
+                    price = price_map.get(iid, 1.0) or 1.0
+                    shares = target_per_stock / price
+                    commission = target_per_stock * commission_rate
+                    current_shares[iid] = shares
+                    current_prices[iid] = price
+                    period_tx.append({
+                        'period':                  period_str,
+                        'action':                  'BUY',
+                        'company':                 _name(iid),
+                        'instrument_id':           iid,
+                        'shares':                  round(shares, 2),
+                        'price_sek':               round(price, 2),
+                        'trade_value_sek':         round(target_per_stock, 2),
+                        'commission_sek':          round(commission, 2),
+                        'model_account_value_sek': None,   # filled after returns
+                        'omxs30_account_value_sek': None,
+                    })
+
+            # ============================================================
+            # REBALANCING (period i > 0): SELL leaving, BUY entering
+            # ============================================================
+            else:
+                # Sell prices: previous price × (1 + previous return)
+                # For staying stocks prefer the current period's month_end_price.
+                sell_price_for: dict = {}
+                for iid in old_ids_set:
+                    prev_p = prev_price_map.get(iid) or current_prices.get(iid, 1.0) or 1.0
+                    prev_r = prev_return_map.get(iid, 0.0)
+                    sell_price_for[iid] = prev_p * (1 + prev_r / 100)
+                for iid in (old_ids_set & new_ids_set):   # staying: use direct price if available
+                    if iid in price_map:
+                        sell_price_for[iid] = price_map[iid]
+
+                # --- SELL leaving stocks ---
+                sell_proceeds = 0.0
+                for iid in sorted(leaving, key=_name):
+                    shares = current_shares.pop(iid, 0.0)
+                    sell_price = sell_price_for.get(iid, 1.0) or 1.0
+                    trade_value = shares * sell_price
+                    commission = trade_value * commission_rate
+                    period_commission += commission
+                    sell_proceeds += trade_value - commission
+                    current_prices.pop(iid, None)
+                    period_tx.append({
+                        'period':                  period_str,
+                        'action':                  'SELL',
+                        'company':                 _name(iid),
+                        'instrument_id':           iid,
+                        'shares':                  round(shares, 2),
+                        'price_sek':               round(sell_price, 2),
+                        'trade_value_sek':         round(trade_value, 2),
+                        'commission_sek':          round(commission, 2),
+                        'model_account_value_sek': None,
+                        'omxs30_account_value_sek': None,
+                    })
+
+                # --- BUY entering stocks (split sell proceeds equally) ---
+                if entering and sell_proceeds > 0:
+                    alloc = sell_proceeds / len(entering)
+                    for iid in sorted(entering, key=_name):
+                        buy_price = price_map.get(iid, 1.0) or 1.0
+                        commission = alloc * commission_rate
+                        period_commission += commission
+                        net_invest = alloc - commission
+                        shares = net_invest / buy_price
+                        current_shares[iid] = shares
+                        current_prices[iid] = buy_price
+                        period_tx.append({
+                            'period':                  period_str,
+                            'action':                  'BUY',
+                            'company':                 _name(iid),
+                            'instrument_id':           iid,
+                            'shares':                  round(shares, 2),
+                            'price_sek':               round(buy_price, 2),
+                            'trade_value_sek':         round(alloc, 2),
+                            'commission_sek':          round(commission, 2),
+                            'model_account_value_sek': None,
+                            'omxs30_account_value_sek': None,
+                        })
+
+            # ============================================================
+            # APPLY RETURNS for the holding period
+            # ============================================================
+            model_value_before_returns = sum(
+                current_shares.get(iid, 0) * current_prices.get(iid, 1.0)
+                for iid in current_shares
+            )
+            new_model_value = 0.0
+            for iid in list(current_shares.keys()):
+                r = return_map.get(iid, 0.0)
+                current_prices[iid] = (current_prices.get(iid, 1.0) or 1.0) * (1 + r / 100)
+                new_model_value += current_shares[iid] * current_prices[iid]
+
+            model_month_return = (
+                (new_model_value / model_value_before_returns - 1) * 100
+                if model_value_before_returns > 0 else 0.0
+            )
+            model_value = new_model_value
+
+            # ---- OMXS30 for the same holding period (month T+1) ----
+            next_year_omx  = year if month < 12 else year + 1
+            next_month_omx = month + 1 if month < 12 else 1
+            omxs30_ret = omxs30_monthly.get((next_year_omx, next_month_omx))
+            if omxs30_ret is not None:
+                omxs30_value *= (1 + omxs30_ret / 100)
+
+            # Fill account values on all transactions for this period
+            for t in period_tx:
+                t['model_account_value_sek']  = round(model_value, 2)
+                t['omxs30_account_value_sek'] = round(omxs30_value, 2)
+            tx_rows.extend(period_tx)
+
+            # Period-level summary row (one per month)
+            period_rows.append({
+                'period':                  period_str,
+                'year':                    year,
+                'month':                   month,
+                'model_account_value_sek': round(model_value, 2),
+                'omxs30_account_value_sek': round(omxs30_value, 2),
+                'model_month_return_pct':  round(model_month_return, 2),
+                'omxs30_month_return_pct': round(omxs30_ret, 2) if omxs30_ret is not None else None,
+                'model_vs_omxs30_pct':     round(model_month_return - (omxs30_ret or 0), 2)
+                                           if omxs30_ret is not None else None,
+                'commission_sek':          round(period_commission, 2),
+                'n_sells':                 len(leaving),
+                'n_buys':                  len(entering),
+            })
+
+            # Store for next iteration
+            prev_price_map  = dict(price_map)
+            prev_return_map = dict(return_map)
+
+        return pd.DataFrame(tx_rows), pd.DataFrame(period_rows)
+
+    def _save_account_report(self, reports_dir: str,
+                              tx_df: pd.DataFrame,
+                              period_df: pd.DataFrame,
+                              initial_capital: float,
+                              commission_rate: float):
+        """Save the account simulation Excel report (transaction log + summaries)."""
+        filepath = os.path.join(reports_dir, 'account_simulation.xlsx')
+
+        with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+
+            if len(tx_df) == 0:
+                print("  Account simulation: no transactions to save.")
+                pd.DataFrame().to_excel(writer, sheet_name='transactions', index=False)
+                return
+
+            # ---- Sheet 1: transaction log ----
+            tx_df.to_excel(writer, sheet_name='transactions', index=False)
+
+            # ---- Sheet 2: monthly side-by-side summary ----
+            period_df.to_excel(writer, sheet_name='monthly_summary', index=False)
+
+            # ---- Sheet 3: yearly summary ----
+            yearly_rows = []
+            for year in sorted(period_df['year'].unique()):
+                yr   = period_df[period_df['year'] == year]
+                prev = period_df[period_df['year'] < year]
+
+                model_start  = (prev['model_account_value_sek'].iloc[-1]
+                                if len(prev) else initial_capital)
+                model_end    = yr['model_account_value_sek'].iloc[-1]
+                omxs30_start = (prev['omxs30_account_value_sek'].iloc[-1]
+                                if len(prev) else initial_capital * (1 - commission_rate))
+                omxs30_end   = yr['omxs30_account_value_sek'].iloc[-1]
+
+                model_annual  = (model_end  / model_start  - 1) * 100
+                omxs30_annual = (omxs30_end / omxs30_start - 1) * 100
+
+                yearly_rows.append({
+                    'year':                   year,
+                    'model_start_sek':        round(model_start, 2),
+                    'model_end_sek':          round(model_end, 2),
+                    'model_annual_return_%':  round(model_annual, 2),
+                    'omxs30_start_sek':       round(omxs30_start, 2),
+                    'omxs30_end_sek':         round(omxs30_end, 2),
+                    'omxs30_annual_return_%': round(omxs30_annual, 2),
+                    'excess_return_%':        round(model_annual - omxs30_annual, 2),
+                    'commission_sek':         round(yr['commission_sek'].sum(), 2),
+                    'beat_omxs30':            'YES' if model_annual > omxs30_annual else 'no',
+                })
+
+            pd.DataFrame(yearly_rows).to_excel(writer, sheet_name='yearly_summary', index=False)
+
+            # ---- Sheet 4: overall summary ----
+            final_model   = period_df['model_account_value_sek'].iloc[-1]
+            final_omxs30  = period_df['omxs30_account_value_sek'].iloc[-1]
+            total_comm    = period_df['commission_sek'].sum()
+            omxs30_init   = initial_capital * (1 - commission_rate)
+            beat_years    = sum(1 for r in yearly_rows if r['beat_omxs30'] == 'YES')
+            total_years   = len(yearly_rows)
+
+            summary_data = [
+                ('Initial Capital (SEK)',               initial_capital),
+                ('Commission Rate',                     f'{commission_rate * 100:.2f}%'),
+                ('N Months Simulated',                  len(period_df)),
+                ('Final Model Account Value (SEK)',     round(final_model, 2)),
+                ('Final OMXS30 Account Value (SEK)',    round(final_omxs30, 2)),
+                ('Model Total Return (%)',              round((final_model  / initial_capital - 1) * 100, 2)),
+                ('OMXS30 Total Return (%)',             round((final_omxs30 / omxs30_init - 1) * 100, 2)),
+                ('Total Commission Paid (SEK)',         round(total_comm, 2)),
+                ('Commission as % of Initial Capital', round(total_comm / initial_capital * 100, 2)),
+                ('Years Beat OMXS30',                  f'{beat_years}/{total_years}'),
+            ]
+            pd.DataFrame(summary_data, columns=['metric', 'value']).to_excel(
+                writer, sheet_name='summary', index=False)
+
+        print(f"  Saved account simulation: {filepath}")
 
     def _save_debug_excel(self, debug_dir: str, year: int, month: int,
                           train_df: pd.DataFrame, test_df: pd.DataFrame,
@@ -1364,6 +1692,14 @@ def main():
                         help='Output directory for debug and report files (default: results)')
     parser.add_argument('--predict-only', action='store_true',
                         help='Skip backtest, only run current-month prediction using all history as training data')
+    parser.add_argument('--initial-capital', type=float, default=100_000,
+                        help='Starting capital in SEK for account simulation (default: 100000)')
+    parser.add_argument('--commission', type=float, default=0.0015,
+                        help='Commission rate per transaction (default: 0.0015 = 0.15%%)')
+    parser.add_argument('--max-stale-days', type=int, default=10,
+                        help='Exclude stocks from current-month prediction whose last price '
+                             'is more than this many days older than the freshest price '
+                             'in the batch (default: 10). Prevents picking suspended/delisted stocks.')
 
     args = parser.parse_args()
 
@@ -1383,7 +1719,10 @@ def main():
         db_config,
         output_dir=args.output_dir,
         min_train_months=args.min_train_months,
-        top_n=args.top_n
+        top_n=args.top_n,
+        initial_capital=args.initial_capital,
+        commission_rate=args.commission,
+        max_stale_days=args.max_stale_days,
     )
 
     try:
