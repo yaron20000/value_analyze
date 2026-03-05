@@ -839,6 +839,14 @@ class MonthlyWalkForwardTrainer:
                 'importance': model.feature_importances_
             }).sort_values('importance', ascending=False)
 
+            # Full return map for ALL test stocks (not just top-N), keyed by instrument_id.
+            # Used in _simulate_account so that leaving stocks always get their correct
+            # prior-period return rather than a silent 0.0 default.
+            all_test_returns = dict(zip(
+                test_df['instrument_id'],
+                test_df['next_month_return'].fillna(0)
+            ))
+
             # Store monthly result
             monthly_result = {
                 'year': test_year,
@@ -863,6 +871,7 @@ class MonthlyWalkForwardTrainer:
                 'top_n_picks': top_n_picks,
                 'top_30_picks': top_30_picks,
                 'top_decile_picks': top_decile_picks,
+                'all_test_returns': all_test_returns,
             }
             all_monthly_results.append(monthly_result)
 
@@ -895,10 +904,12 @@ class MonthlyWalkForwardTrainer:
         self._save_account_report(
             reports_dir, tx_df, period_df,
             self.initial_capital, self.commission_rate,
+            yearly_results=yearly_results,
+            monthly_results=all_monthly_results,
         )
 
-        # Print summary
-        self._print_summary(yearly_results, all_monthly_results)
+        # Print summary (pass account period_df for account return display)
+        self._print_summary(yearly_results, all_monthly_results, account_period_df=period_df)
 
         # Predict on the current (possibly incomplete) month using all historical data
         if len(df_current) > 0:
@@ -927,17 +938,37 @@ class MonthlyWalkForwardTrainer:
 
         Returns:
             (transactions_df, period_summary_df)
+
+        NOTE — Why this account and the backtest "return %" will always differ slightly
+        even after all bug fixes:
+
+        1. Equal-weight vs. drifting weights: The backtest computes an arithmetic mean
+           of next_month_return across the top-N picks each month, implicitly assuming
+           perfect equal-weight rebalancing every month.  This account only rebalances
+           stocks that actually enter or leave the top-N list; staying stocks are left
+           untouched, so their weights drift as prices diverge.  A stock that gained
+           30 % over three months will be over-weight relative to the equal-weight
+           baseline, amplifying its future returns (good or bad).
+
+        2. Commission drag: Every buy and sell here subtracts commission_rate of the
+           trade value.  The backtest path never deducts commissions.  With 30-50 %
+           monthly turnover this creates roughly 0.9-1.5 % of annualised drag.
+
+        3. Different index benchmarks: The account tracks the next calendar month's
+           OMXS30 return; the backtest tracks market_median_monthly_return.  These
+           should not be compared directly.
         """
         omxs30_monthly = self.index_returns.get('OMXS30', {})
 
         model_value: float = initial_capital
         omxs30_value: float = initial_capital * (1 - commission_rate)
 
-        current_shares: dict = {}   # {iid: shares held}
-        current_prices: dict = {}   # {iid: price last used for this position}
-        prev_price_map: dict = {}   # price_map from the previous period
-        prev_return_map: dict = {}  # return_map from the previous period
-        all_names: dict = {}        # cumulative {iid: company_name} across all periods
+        current_shares: dict = {}        # {iid: shares held}
+        current_prices: dict = {}        # {iid: price last used for this position}
+        prev_price_map: dict = {}        # price_map from the previous period
+        prev_return_map: dict = {}       # top-N return_map from the previous period
+        prev_full_return_map: dict = {}  # full-test return_map from the previous period
+        all_names: dict = {}             # cumulative {iid: company_name} across all periods
 
         tx_rows: list = []
         period_rows: list = []
@@ -968,6 +999,11 @@ class MonthlyWalkForwardTrainer:
                 picks_df['next_month_return'].fillna(0)
             ))
 
+            # Full return map covering ALL test stocks for this period, not just top-N.
+            # Stored so that the next period can look up the correct return for any
+            # stock being sold (including those that are leaving the top-N list).
+            full_return_map = mr.get('all_test_returns', return_map)
+
             leaving  = old_ids_set - new_ids_set
             entering = new_ids_set - old_ids_set
             period_commission = 0.0
@@ -980,6 +1016,10 @@ class MonthlyWalkForwardTrainer:
             # INITIAL PURCHASE (period 0)
             # ============================================================
             if i == 0:
+                # Charge one portfolio-level commission for the entire initial buy,
+                # then split the net capital equally across all stocks.
+                # (Do NOT charge an additional per-stock commission here — that
+                # would double-count commission on every position at inception.)
                 init_commission = model_value * commission_rate
                 period_commission = init_commission
                 model_value -= init_commission
@@ -988,7 +1028,6 @@ class MonthlyWalkForwardTrainer:
                 for iid in sorted(new_ids_set, key=_name):
                     price = price_map.get(iid, 1.0) or 1.0
                     shares = target_per_stock / price
-                    commission = target_per_stock * commission_rate
                     current_shares[iid] = shares
                     current_prices[iid] = price
                     period_tx.append({
@@ -999,8 +1038,8 @@ class MonthlyWalkForwardTrainer:
                         'shares':                  round(shares, 2),
                         'price_sek':               round(price, 2),
                         'trade_value_sek':         round(target_per_stock, 2),
-                        'commission_sek':          round(commission, 2),
-                        'model_account_value_sek': None,   # filled after returns
+                        'commission_sek':          0.0,   # already captured in init_commission
+                        'model_account_value_sek': None,  # filled after returns
                         'omxs30_account_value_sek': None,
                     })
 
@@ -1009,11 +1048,14 @@ class MonthlyWalkForwardTrainer:
             # ============================================================
             else:
                 # Sell prices: previous price × (1 + previous return)
+                # Use prev_full_return_map (covers all test stocks) so that leaving
+                # stocks always get their correct prior-period return rather than
+                # falling back silently to 0.0.
                 # For staying stocks prefer the current period's month_end_price.
                 sell_price_for: dict = {}
                 for iid in old_ids_set:
                     prev_p = prev_price_map.get(iid) or current_prices.get(iid, 1.0) or 1.0
-                    prev_r = prev_return_map.get(iid, 0.0)
+                    prev_r = prev_full_return_map.get(iid, prev_return_map.get(iid, 0.0))
                     sell_price_for[iid] = prev_p * (1 + prev_r / 100)
                 for iid in (old_ids_set & new_ids_set):   # staying: use direct price if available
                     if iid in price_map:
@@ -1069,14 +1111,29 @@ class MonthlyWalkForwardTrainer:
             # ============================================================
             # APPLY RETURNS for the holding period
             # ============================================================
+            # Use sell_price_for (available for i > 0) so that staying stocks
+            # are valued at the same price used in the buy/sell logic rather
+            # than the potentially stale current_prices value from last period.
+            # For i == 0 and for newly-bought entering stocks, current_prices
+            # already holds the correct buy price set in the BUY loop above.
+            if i == 0:
+                _price_at_start = current_prices
+            else:
+                _price_at_start = {
+                    iid: sell_price_for.get(iid, current_prices.get(iid, 1.0))
+                    for iid in current_shares
+                }
             model_value_before_returns = sum(
-                current_shares.get(iid, 0) * current_prices.get(iid, 1.0)
+                current_shares.get(iid, 0) * _price_at_start.get(iid, 1.0)
                 for iid in current_shares
             )
             new_model_value = 0.0
             for iid in list(current_shares.keys()):
                 r = return_map.get(iid, 0.0)
-                current_prices[iid] = (current_prices.get(iid, 1.0) or 1.0) * (1 + r / 100)
+                # Use _price_at_start as the base for each position so that the
+                # end-of-period price is consistent with the pre-return valuation.
+                base_price = _price_at_start.get(iid, current_prices.get(iid, 1.0)) or 1.0
+                current_prices[iid] = base_price * (1 + r / 100)
                 new_model_value += current_shares[iid] * current_prices[iid]
 
             model_month_return = (
@@ -1115,8 +1172,9 @@ class MonthlyWalkForwardTrainer:
             })
 
             # Store for next iteration
-            prev_price_map  = dict(price_map)
-            prev_return_map = dict(return_map)
+            prev_price_map       = dict(price_map)
+            prev_return_map      = dict(return_map)
+            prev_full_return_map = dict(full_return_map)
 
         return pd.DataFrame(tx_rows), pd.DataFrame(period_rows)
 
@@ -1124,7 +1182,9 @@ class MonthlyWalkForwardTrainer:
                               tx_df: pd.DataFrame,
                               period_df: pd.DataFrame,
                               initial_capital: float,
-                              commission_rate: float):
+                              commission_rate: float,
+                              yearly_results: list = None,
+                              monthly_results: list = None):
         """Save the account simulation Excel report (transaction log + summaries)."""
         filepath = os.path.join(reports_dir, 'account_simulation.xlsx')
 
@@ -1194,6 +1254,73 @@ class MonthlyWalkForwardTrainer:
             ]
             pd.DataFrame(summary_data, columns=['metric', 'value']).to_excel(
                 writer, sheet_name='summary', index=False)
+
+            # ---- Sheet 5: reconciliation ----
+            # Shows how the account return relates to the backtest return and
+            # breaks the gap into commission drag and weighting/other difference.
+            account_total_ret = round((final_model / initial_capital - 1) * 100, 2)
+
+            # Backtest compounded return for the top-N portfolio across the full period
+            if yearly_results:
+                backtest_cum = 1.0
+                for yr_r in yearly_results:
+                    backtest_cum *= (1 + yr_r['top_n_return'] / 100)
+                backtest_total_ret = round((backtest_cum - 1) * 100, 2)
+            else:
+                backtest_total_ret = None
+
+            # Commission drag expressed as a negative percentage of initial capital
+            commission_drag_pct = round(-(total_comm / initial_capital * 100), 2)
+
+            # Weighting difference: the residual after accounting for commission drag.
+            # A positive value means the drifting-weight account outperformed the
+            # equal-weight backtest net of commissions; negative means it lagged.
+            if backtest_total_ret is not None:
+                weighting_diff_pct = round(
+                    account_total_ret - backtest_total_ret - commission_drag_pct, 2)
+            else:
+                weighting_diff_pct = None
+
+            recon_data = [
+                ('Backtest Return % (equal-weight, no commission)',
+                 backtest_total_ret),
+                ('Account Return % (drifting-weight, after commission)',
+                 account_total_ret),
+                ('Commission Drag % (total commission / initial capital, negative)',
+                 commission_drag_pct),
+                ('Weighting & Other Difference % (account - backtest - commission drag)',
+                 weighting_diff_pct),
+            ]
+            pd.DataFrame(recon_data, columns=['metric', 'value']).to_excel(
+                writer, sheet_name='reconciliation', index=False)
+
+            # ---- Sheet 6: monthly reconciliation ----
+            # Joins per-month account data (period_df) with the flat monthly_results
+            # list so each row shows backtest top-N return, account return, delta,
+            # and commission paid for that month.
+            if monthly_results:
+                mr_rows = []
+                for mr in monthly_results:
+                    mr_key = f"{mr['year']}-{mr['month']:02d}"
+                    acc_row = period_df[period_df['period'] == mr_key]
+                    acc_ret = float(acc_row['model_month_return_pct'].iloc[0]) \
+                        if len(acc_row) > 0 else None
+                    comm = float(acc_row['commission_sek'].iloc[0]) \
+                        if len(acc_row) > 0 else None
+                    backtest_ret = mr.get('top_n_return')
+                    delta = round(acc_ret - backtest_ret, 4) \
+                        if (acc_ret is not None and backtest_ret is not None) else None
+                    mr_rows.append({
+                        'period':                  mr_key,
+                        'year':                    mr['year'],
+                        'month':                   mr['month'],
+                        'backtest_top_n_return_%': round(backtest_ret, 4) if backtest_ret is not None else None,
+                        'account_month_return_%':  round(acc_ret, 4) if acc_ret is not None else None,
+                        'delta_pct':               delta,
+                        'commission_sek':          round(comm, 2) if comm is not None else None,
+                    })
+                pd.DataFrame(mr_rows).to_excel(
+                    writer, sheet_name='monthly_reconciliation', index=False)
 
         print(f"  Saved account simulation: {filepath}")
 
@@ -1594,7 +1721,8 @@ class MonthlyWalkForwardTrainer:
 
         print(f"\nSaved summary report: {filepath}")
 
-    def _print_summary(self, yearly_results: list, monthly_results: list):
+    def _print_summary(self, yearly_results: list, monthly_results: list,
+                        account_period_df: pd.DataFrame = None):
         """Print final summary to console."""
         print(f"\n{'='*70}")
         print(f"MONTHLY WALK-FORWARD BACKTEST SUMMARY")
@@ -1670,6 +1798,58 @@ class MonthlyWalkForwardTrainer:
                 idx_vals += f' {v:>+7.1f}%' if v is not None else f' {"N/A":>8}'
             print(f"  {r['year']:<6} {r['n_months']:>6} {r['benchmark_return']:>+9.2f}% "
                   f"{r['top_n_return']:>+9.2f}% {r['top_30_return']:>+9.2f}% {r['decile_return']:>+9.2f}% {beat:>6}{idx_vals}")
+
+        # ---- Account simulation results ----
+        if account_period_df is not None and len(account_period_df) > 0:
+            final_model_val  = account_period_df['model_account_value_sek'].iloc[-1]
+            total_comm       = account_period_df['commission_sek'].sum()
+            account_total_ret = (final_model_val / self.initial_capital - 1) * 100
+            print(f"\nAccount Simulation (initial capital: {self.initial_capital:,.0f} SEK):")
+            print(f"  Final account value:  {final_model_val:>12,.2f} SEK")
+            print(f"  Total account return: {account_total_ret:>+11.2f}%")
+            print(f"  Total commission paid:{total_comm:>12,.2f} SEK  "
+                  f"({total_comm / self.initial_capital * 100:.2f}% of initial capital)")
+            # Backtest compounded return over same period (top-N)
+            backtest_cum = 1.0
+            for r in yearly_results:
+                backtest_cum *= (1 + r['top_n_return'] / 100)
+            backtest_total_ret = (backtest_cum - 1) * 100
+            comm_drag = -(total_comm / self.initial_capital * 100)
+            print(f"  Backtest compounded:  {backtest_total_ret:>+11.2f}%  "
+                  f"(equal-weight, no commissions)")
+            weighting_other = account_total_ret - backtest_total_ret - comm_drag
+            print(f"  Discrepancy breakdown:")
+            print(f"    Commission drag:    {comm_drag:>+11.2f}%")
+            print(f"    Weighting/other:    {weighting_other:>+11.2f}%")
+
+            # Threshold check: is the residual within ±5% of initial capital?
+            threshold_pct = 5.0
+            if abs(weighting_other) <= threshold_pct:
+                print(f"    (Weighting & Other residual is within expected ±{threshold_pct:.0f}% range)")
+            else:
+                print(f"    WARNING: Account/backtest discrepancy exceeds expected range "
+                      f"(|{weighting_other:+.2f}%| > {threshold_pct:.0f}%)")
+
+            # Worst single-month divergence between backtest and account return
+            worst_period = None
+            worst_delta = None
+            for mr in monthly_results:
+                mr_key = f"{mr['year']}-{mr['month']:02d}"
+                acc_rows = account_period_df[account_period_df['period'] == mr_key]
+                if len(acc_rows) == 0:
+                    continue
+                acc_ret = float(acc_rows['model_month_return_pct'].iloc[0])
+                bt_ret = mr.get('top_n_return')
+                if bt_ret is None:
+                    continue
+                delta = abs(acc_ret - bt_ret)
+                if worst_delta is None or delta > worst_delta:
+                    worst_delta = delta
+                    worst_period = (mr_key, acc_ret, bt_ret)
+            if worst_period is not None:
+                p, a, b = worst_period
+                print(f"    Worst single-month divergence: {p}  "
+                      f"account={a:+.2f}%  backtest={b:+.2f}%  delta={a - b:+.2f}%")
 
         print(f"\nOutputs saved to: {os.path.abspath(self.output_dir)}/")
         print(f"  debug/   - Model inputs + outputs per month")
