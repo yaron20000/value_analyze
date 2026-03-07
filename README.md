@@ -11,6 +11,10 @@ This project fetches data from the Borsdata API and stores it in PostgreSQL for 
 - ✅ Handles API rate limiting
 - ✅ Comprehensive error handling and logging
 
+## run 
+
+docker start postgres-borsdata
+
 ## Setup
 
 ### 1. Install Dependencies

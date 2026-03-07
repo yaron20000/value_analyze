@@ -901,15 +901,24 @@ class MonthlyWalkForwardTrainer:
             initial_capital=self.initial_capital,
             commission_rate=self.commission_rate,
         )
+        _rebal_tx_df, rebal_period_df = self._simulate_account(
+            all_monthly_results,
+            initial_capital=self.initial_capital,
+            commission_rate=self.commission_rate,
+            rebalance=False,
+        )
         self._save_account_report(
             reports_dir, tx_df, period_df,
             self.initial_capital, self.commission_rate,
             yearly_results=yearly_results,
             monthly_results=all_monthly_results,
+            rebal_period_df=rebal_period_df,
         )
 
         # Print summary (pass account period_df for account return display)
-        self._print_summary(yearly_results, all_monthly_results, account_period_df=period_df)
+        self._print_summary(yearly_results, all_monthly_results,
+                            account_period_df=period_df,
+                            rebal_account_period_df=rebal_period_df)
 
         # Predict on the current (possibly incomplete) month using all historical data
         if len(df_current) > 0:
@@ -919,7 +928,8 @@ class MonthlyWalkForwardTrainer:
 
     def _simulate_account(self, monthly_results: list,
                           initial_capital: float = 100_000,
-                          commission_rate: float = 0.0015) -> tuple:
+                          commission_rate: float = 0.0015,
+                          rebalance: bool = False) -> tuple:
         """
         Simulate a trading account following the model's top-N picks.
 
@@ -1047,19 +1057,21 @@ class MonthlyWalkForwardTrainer:
             # REBALANCING (period i > 0): SELL leaving, BUY entering
             # ============================================================
             else:
-                # Sell prices: previous price × (1 + previous return)
-                # Use prev_full_return_map (covers all test stocks) so that leaving
-                # stocks always get their correct prior-period return rather than
-                # falling back silently to 0.0.
-                # For staying stocks prefer the current period's month_end_price.
-                sell_price_for: dict = {}
-                for iid in old_ids_set:
-                    prev_p = prev_price_map.get(iid) or current_prices.get(iid, 1.0) or 1.0
-                    prev_r = prev_full_return_map.get(iid, prev_return_map.get(iid, 0.0))
-                    sell_price_for[iid] = prev_p * (1 + prev_r / 100)
-                for iid in (old_ids_set & new_ids_set):   # staying: use direct price if available
-                    if iid in price_map:
-                        sell_price_for[iid] = price_map[iid]
+                # Sell prices: use current_prices directly.
+                # current_prices[iid] already holds the end-of-previous-period value
+                # (base_price × (1 + return)) set in the last period's return loop.
+                # Using prev_price_map × (1 + prev_return) would be equivalent only
+                # when next_month_return is a pure price return; if it includes
+                # dividends while month_end_price is ex-dividend, the two diverge and
+                # the old approach caused an implicit value drop at each period
+                # transition — most visible at year-start (dividend season).
+                # Using current_prices avoids this and also fixes a double-return bug
+                # for stocks whose month_end_price was missing (and therefore not
+                # stored in prev_price_map).
+                sell_price_for: dict = {
+                    iid: current_prices.get(iid, 1.0) or 1.0
+                    for iid in old_ids_set
+                }
 
                 # --- SELL leaving stocks ---
                 sell_proceeds = 0.0
@@ -1111,18 +1123,12 @@ class MonthlyWalkForwardTrainer:
             # ============================================================
             # APPLY RETURNS for the holding period
             # ============================================================
-            # Use sell_price_for (available for i > 0) so that staying stocks
-            # are valued at the same price used in the buy/sell logic rather
-            # than the potentially stale current_prices value from last period.
-            # For i == 0 and for newly-bought entering stocks, current_prices
-            # already holds the correct buy price set in the BUY loop above.
-            if i == 0:
-                _price_at_start = current_prices
-            else:
-                _price_at_start = {
-                    iid: sell_price_for.get(iid, current_prices.get(iid, 1.0))
-                    for iid in current_shares
-                }
+            # current_prices holds the correct base price for every position:
+            #   - initial buys (i==0): price_map price (or 1.0 default)
+            #   - staying stocks: end-of-previous-period computed price
+            #   - entering stocks: buy price set in the BUY loop above
+            # Using a copy avoids mutating the dict while iterating over it.
+            _price_at_start = dict(current_prices)
             model_value_before_returns = sum(
                 current_shares.get(iid, 0) * _price_at_start.get(iid, 1.0)
                 for iid in current_shares
@@ -1141,6 +1147,25 @@ class MonthlyWalkForwardTrainer:
                 if model_value_before_returns > 0 else 0.0
             )
             model_value = new_model_value
+
+            # ---- MONTHLY EQUAL-WEIGHT REBALANCING ----
+            if rebalance and len(current_shares) > 1:
+                n = len(current_shares)
+                target = model_value / n
+                one_sided = sum(
+                    max(0.0, current_shares[iid] * current_prices[iid] - target)
+                    for iid in current_shares
+                )
+                rebal_commission = one_sided * 2 * commission_rate  # sell side + buy side
+                period_commission += rebal_commission
+                model_value -= rebal_commission
+                model_month_return = (
+                    (model_value / model_value_before_returns - 1) * 100
+                    if model_value_before_returns > 0 else 0.0
+                )
+                target_after = model_value / n
+                for iid in current_shares:
+                    current_shares[iid] = target_after / (current_prices[iid] or 1.0)
 
             # ---- OMXS30 for the same holding period (month T+1) ----
             next_year_omx  = year if month < 12 else year + 1
@@ -1184,7 +1209,8 @@ class MonthlyWalkForwardTrainer:
                               initial_capital: float,
                               commission_rate: float,
                               yearly_results: list = None,
-                              monthly_results: list = None):
+                              monthly_results: list = None,
+                              rebal_period_df: pd.DataFrame = None):
         """Save the account simulation Excel report (transaction log + summaries)."""
         filepath = os.path.join(reports_dir, 'account_simulation.xlsx')
 
@@ -1199,7 +1225,16 @@ class MonthlyWalkForwardTrainer:
             tx_df.to_excel(writer, sheet_name='transactions', index=False)
 
             # ---- Sheet 2: monthly side-by-side summary ----
-            period_df.to_excel(writer, sheet_name='monthly_summary', index=False)
+            monthly_out = period_df.copy()
+            if rebal_period_df is not None and len(rebal_period_df) > 0:
+                rebal_cols = rebal_period_df[['period', 'model_account_value_sek',
+                                              'model_month_return_pct', 'commission_sek']].rename(columns={
+                    'model_account_value_sek':  'rebal_account_value_sek',
+                    'model_month_return_pct':   'rebal_month_return_pct',
+                    'commission_sek':           'rebal_commission_sek',
+                })
+                monthly_out = monthly_out.merge(rebal_cols, on='period', how='left')
+            monthly_out.to_excel(writer, sheet_name='monthly_summary', index=False)
 
             # ---- Sheet 3: yearly summary ----
             yearly_rows = []
@@ -1217,7 +1252,7 @@ class MonthlyWalkForwardTrainer:
                 model_annual  = (model_end  / model_start  - 1) * 100
                 omxs30_annual = (omxs30_end / omxs30_start - 1) * 100
 
-                yearly_rows.append({
+                row = {
                     'year':                   year,
                     'model_start_sek':        round(model_start, 2),
                     'model_end_sek':          round(model_end, 2),
@@ -1228,7 +1263,22 @@ class MonthlyWalkForwardTrainer:
                     'excess_return_%':        round(model_annual - omxs30_annual, 2),
                     'commission_sek':         round(yr['commission_sek'].sum(), 2),
                     'beat_omxs30':            'YES' if model_annual > omxs30_annual else 'no',
-                })
+                }
+
+                if rebal_period_df is not None and len(rebal_period_df) > 0:
+                    yr_r  = rebal_period_df[rebal_period_df['year'] == year]
+                    prev_r = rebal_period_df[rebal_period_df['year'] < year]
+                    rebal_start = (prev_r['model_account_value_sek'].iloc[-1]
+                                   if len(prev_r) else initial_capital)
+                    rebal_end   = yr_r['model_account_value_sek'].iloc[-1] if len(yr_r) else rebal_start
+                    rebal_annual = (rebal_end / rebal_start - 1) * 100
+                    row['rebal_start_sek']        = round(rebal_start, 2)
+                    row['rebal_end_sek']          = round(rebal_end, 2)
+                    row['rebal_annual_return_%']  = round(rebal_annual, 2)
+                    row['rebal_commission_sek']   = round(yr_r['commission_sek'].sum(), 2) if len(yr_r) else 0.0
+                    row['rebal_vs_drifting_%']    = round(rebal_annual - model_annual, 2)
+
+                yearly_rows.append(row)
 
             pd.DataFrame(yearly_rows).to_excel(writer, sheet_name='yearly_summary', index=False)
 
@@ -1252,6 +1302,14 @@ class MonthlyWalkForwardTrainer:
                 ('Commission as % of Initial Capital', round(total_comm / initial_capital * 100, 2)),
                 ('Years Beat OMXS30',                  f'{beat_years}/{total_years}'),
             ]
+            if rebal_period_df is not None and len(rebal_period_df) > 0:
+                final_rebal      = rebal_period_df['model_account_value_sek'].iloc[-1]
+                total_rebal_comm = rebal_period_df['commission_sek'].sum()
+                summary_data += [
+                    ('Final Rebalanced Account Value (SEK)',     round(final_rebal, 2)),
+                    ('Rebalanced Total Return (%)',              round((final_rebal / initial_capital - 1) * 100, 2)),
+                    ('Rebalanced Total Commission Paid (SEK)',   round(total_rebal_comm, 2)),
+                ]
             pd.DataFrame(summary_data, columns=['metric', 'value']).to_excel(
                 writer, sheet_name='summary', index=False)
 
@@ -1291,6 +1349,19 @@ class MonthlyWalkForwardTrainer:
                 ('Weighting & Other Difference % (account - backtest - commission drag)',
                  weighting_diff_pct),
             ]
+            if rebal_period_df is not None and len(rebal_period_df) > 0:
+                final_rebal = rebal_period_df['model_account_value_sek'].iloc[-1]
+                rebal_total_ret = round((final_rebal / initial_capital - 1) * 100, 2)
+                total_rebal_comm = rebal_period_df['commission_sek'].sum()
+                rebal_comm_drag = round(-(total_rebal_comm / initial_capital * 100), 2)
+                recon_data.append(
+                    ('Rebalanced Account Return % (equal-weight monthly, after commission)',
+                     rebal_total_ret)
+                )
+                recon_data.append(
+                    ('Rebalanced Commission Drag % (includes rebalancing trades)',
+                     rebal_comm_drag)
+                )
             pd.DataFrame(recon_data, columns=['metric', 'value']).to_excel(
                 writer, sheet_name='reconciliation', index=False)
 
@@ -1310,12 +1381,18 @@ class MonthlyWalkForwardTrainer:
                     backtest_ret = mr.get('top_n_return')
                     delta = round(acc_ret - backtest_ret, 4) \
                         if (acc_ret is not None and backtest_ret is not None) else None
+                    rebal_ret = None
+                    if rebal_period_df is not None and len(rebal_period_df) > 0:
+                        rebal_row = rebal_period_df[rebal_period_df['period'] == mr_key]
+                        if len(rebal_row) > 0:
+                            rebal_ret = round(float(rebal_row['model_month_return_pct'].iloc[0]), 4)
                     mr_rows.append({
                         'period':                  mr_key,
                         'year':                    mr['year'],
                         'month':                   mr['month'],
                         'backtest_top_n_return_%': round(backtest_ret, 4) if backtest_ret is not None else None,
                         'account_month_return_%':  round(acc_ret, 4) if acc_ret is not None else None,
+                        'rebal_month_return_%':    rebal_ret,
                         'delta_pct':               delta,
                         'commission_sek':          round(comm, 2) if comm is not None else None,
                     })
@@ -1722,7 +1799,8 @@ class MonthlyWalkForwardTrainer:
         print(f"\nSaved summary report: {filepath}")
 
     def _print_summary(self, yearly_results: list, monthly_results: list,
-                        account_period_df: pd.DataFrame = None):
+                        account_period_df: pd.DataFrame = None,
+                        rebal_account_period_df: pd.DataFrame = None):
         """Print final summary to console."""
         print(f"\n{'='*70}")
         print(f"MONTHLY WALK-FORWARD BACKTEST SUMMARY")
@@ -1850,6 +1928,27 @@ class MonthlyWalkForwardTrainer:
                 p, a, b = worst_period
                 print(f"    Worst single-month divergence: {p}  "
                       f"account={a:+.2f}%  backtest={b:+.2f}%  delta={a - b:+.2f}%")
+
+        # ---- Rebalanced account results ----
+        if rebal_account_period_df is not None and len(rebal_account_period_df) > 0:
+            final_rebal_val   = rebal_account_period_df['model_account_value_sek'].iloc[-1]
+            total_rebal_comm  = rebal_account_period_df['commission_sek'].sum()
+            rebal_total_ret   = (final_rebal_val / self.initial_capital - 1) * 100
+            print(f"\nRebalanced Account (equal-weight monthly, initial capital: {self.initial_capital:,.0f} SEK):")
+            print(f"  Final account value:  {final_rebal_val:>12,.2f} SEK")
+            print(f"  Total account return: {rebal_total_ret:>+11.2f}%")
+            print(f"  Total commission paid:{total_rebal_comm:>12,.2f} SEK  "
+                  f"({total_rebal_comm / self.initial_capital * 100:.2f}% of initial capital, includes rebalancing)")
+            if account_period_df is not None and len(account_period_df) > 0:
+                drifting_ret = (account_period_df['model_account_value_sek'].iloc[-1] / self.initial_capital - 1) * 100
+                print(f"  vs Drifting account:  {rebal_total_ret - drifting_ret:>+11.2f}%  (rebalanced - drifting)")
+            backtest_cum = 1.0
+            for r in yearly_results:
+                backtest_cum *= (1 + r['top_n_return'] / 100)
+            backtest_total_ret = (backtest_cum - 1) * 100
+            rebal_comm_drag = -(total_rebal_comm / self.initial_capital * 100)
+            print(f"  vs Backtest:          {rebal_total_ret - backtest_total_ret:>+11.2f}%  "
+                  f"(gap attributable to commission only: {rebal_comm_drag:+.2f}%)")
 
         print(f"\nOutputs saved to: {os.path.abspath(self.output_dir)}/")
         print(f"  debug/   - Model inputs + outputs per month")
